@@ -1,3 +1,5 @@
+<img src="./streaming.png" width="400px"></img>
+
 ## Streaming Deep RL (wip)
 
 Explorations into the proposed [Streaming Deep Reinforcement Learning](https://arxiv.org/abs/2410.14606), from University of Alberta
