@@ -195,9 +195,9 @@ class BroMLP(Module):
 
         layers = []
 
-        self.proj_in = Sequential(
+        self.proj_in = nn.Sequential(
             nn.Linear(dim, dim_hidden),
-            ReluSquared(),
+            nn.ReLU(),
             nn.LayerNorm(dim_hidden, bias = False),
         )
 
@@ -205,10 +205,10 @@ class BroMLP(Module):
 
         for _ in range(depth):
 
-            layer = Sequential(
+            layer = nn.Sequential(
                 nn.Linear(dim_hidden, dim_inner),
                 nn.Dropout(dropout),
-                ReluSquared(),
+                nn.ReLU(),
                 nn.LayerNorm(dim_inner, bias = False),
                 nn.Linear(dim_inner, dim_hidden),
                 nn.LayerNorm(dim_hidden, bias = False),
@@ -224,6 +224,12 @@ class BroMLP(Module):
         self.final_norm = nn.LayerNorm(dim_hidden) if final_norm else nn.Identity()
 
         self.proj_out = nn.Linear(dim_hidden, dim_out)
+
+        self.apply(self.init_)
+
+    def init_(self, module):
+        if isinstance(module, nn.Linear):
+            sparse_init_(module)
 
     def forward(self, x):
 
@@ -265,3 +271,5 @@ if __name__ == '__main__':
     print(f'scaled reward std: {norm_reward.variance.sqrt().item()}')
 
     sparse_init_(nn.Linear(512, 512))
+
+    mlp = BroMLP(5, 5)
