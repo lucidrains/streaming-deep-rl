@@ -6,6 +6,8 @@ Explorations into the proposed [Streaming Deep Reinforcement Learning](https://a
 
 Once completed, if it checks out, will reach to integrate the Stream Q(λ) with [Q-Transformer](https://github.com/lucidrains/q-transformer)
 
+The official repository can be found <a href="https://github.com/mohmdelsayed/streaming-drl">here</a>
+
 ## Citations
 
 ```bibtex
