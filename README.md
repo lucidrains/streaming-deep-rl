@@ -4,6 +4,8 @@
 
 Explorations into the proposed [Streaming Deep Reinforcement Learning](https://arxiv.org/abs/2410.14606), from University of Alberta
 
+Once completed, if it checks out, will reach to integrate the Stream Q(λ) with [Q-Transformer](https://github.com/lucidrains/q-transformer)
+
 ## Citations
 
 ```bibtex
