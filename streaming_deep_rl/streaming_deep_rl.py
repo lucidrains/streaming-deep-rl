@@ -173,6 +173,68 @@ class ScaleReward(Module):
 
         return normed_reward
 
+# "bro" mlp
+# in this paper, they claim layernorm should be before activation, without any gamma + bias
+# will go with BroMLP for now as i have seen it work well, and it is heavily normalized already
+
+class BroMLP(Module):
+
+    def __init__(
+        self,
+        dim,
+        dim_out,
+        dim_hidden = None,
+        depth = 3,
+        dropout = 0.,
+        expansion_factor = 2,
+        final_norm = False,
+    ):
+        super().__init__()
+
+        dim_hidden = default(dim_hidden, dim * 2)
+
+        layers = []
+
+        self.proj_in = Sequential(
+            nn.Linear(dim, dim_hidden),
+            ReluSquared(),
+            nn.LayerNorm(dim_hidden, bias = False),
+        )
+
+        dim_inner = dim_hidden * expansion_factor
+
+        for _ in range(depth):
+
+            layer = Sequential(
+                nn.Linear(dim_hidden, dim_inner),
+                nn.Dropout(dropout),
+                ReluSquared(),
+                nn.LayerNorm(dim_inner, bias = False),
+                nn.Linear(dim_inner, dim_hidden),
+                nn.LayerNorm(dim_hidden, bias = False),
+            )
+
+            nn.init.constant_(layer[-1].weight, 1e-5)
+            layers.append(layer)
+
+        # final layer out
+
+        self.layers = ModuleList(layers)
+
+        self.final_norm = nn.LayerNorm(dim_hidden) if final_norm else nn.Identity()
+
+        self.proj_out = nn.Linear(dim_hidden, dim_out)
+
+    def forward(self, x):
+
+        x = self.proj_in(x)
+
+        for layer in self.layers:
+            x = layer(x) + x
+
+        x = self.final_norm(x)
+        return self.proj_out(x)
+
 # classes
 
 class StreamingDeepRL(Module):
