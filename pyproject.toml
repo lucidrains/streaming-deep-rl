@@ -1,6 +1,6 @@
 [project]
 name = "streaming-deep-rl"
-version = "0.0.1"
+version = "0.0.2"
 description = "Streaming Deep Reinforcement Learning"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
