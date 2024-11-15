@@ -17,6 +17,30 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+# initialization
+
+def sparse_init_(
+    l: nn.Linear,
+    sparsity = 0.9
+):
+    """
+    Algorithm 1
+    """
+    weight, bias = l.weight, l.bias
+    _, fan_in = weight.shape
+
+    value = fan_in ** -0.5
+    nn.init.uniform_(weight, -value, value)
+
+    assert 0. <= sparsity <= 1.
+
+    n = int(fan_in * sparsity)
+    sparse_indices = torch.randperm(fan_in)[:n]
+    nn.init.zeros_(weight[:, sparse_indices])
+
+    if exists(bias):
+        nn.init.zeros_(bias)
+
 # online normalization from Welford in 1962
 
 class NormalizeObservation(Module):
@@ -177,3 +201,5 @@ if __name__ == '__main__':
         norm_reward(el, is_terminal = True)
 
     print(f'scaled reward std: {norm_reward.variance.sqrt().item()}')
+
+    sparse_init_(nn.Linear(512, 512))
