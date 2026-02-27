@@ -30,7 +30,7 @@ dependencies = [
     "ema-pytorch",
     "hl-gauss-pytorch",
     "torch>=2.4",
-    "x-mlps-pytorch"
+    "x-mlps-pytorch>=0.2.5"
 ]
 
 [project.urls]

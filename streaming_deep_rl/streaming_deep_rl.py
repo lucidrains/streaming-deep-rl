@@ -1,6 +1,9 @@
+from __future__ import annotations
+from typing import Callable
+
 import torch
 from torch import nn, tensor, atan2, sqrt
-from torch.nn import Module, ModuleList
+from torch.nn import Module, ModuleList, Linear
 from torch.optim.optimizer import Optimizer
 
 import torch.nn.functional as F
@@ -9,7 +12,7 @@ from einops import einsum, rearrange, repeat, reduce, pack, unpack
 
 from adam_atan2_pytorch.adam_atan2_with_wasserstein_reg import Adam
 
-import gymnasium as gym
+from discrete_continuous_embed_readout import Readout
 
 # helpers
 
@@ -22,7 +25,7 @@ def default(v, d):
 # initialization
 
 def sparse_init_(
-    l: nn.Linear,
+    l: Linear,
     sparsity = 0.9
 ):
     """
@@ -355,9 +358,85 @@ class AdamAtan2(Optimizer):
 
 # classes
 
-class StreamingDeepRL(Module):
-    def __init__(self):
+# streaming AC variant
+
+class StreamingACLambda(Module):
+    def __init__(
+        self,
+        *,
+        actor: Module,
+        critic: Module,
+        dim_actor,
+        num_discrete_actions = None,
+        num_continuous_actions = None,
+        discount_factor = 0.999,
+    ):
         super().__init__()
+        self.actor = actor
+        self.critic = critic
+
+        self.readout = Readout(dim_actor, 1)
+
+        # sparse init
+
+        self.apply(self.init_)
+
+    def init_(self, module):
+        if not isinstance(module, Linear):
+            return
+
+        sparse_init_(module)
+
+    def update(
+        self,
+        state,
+        action,
+        next_state,
+        rewards
+    ):
+        raise NotImplementedError
+
+    def forward(
+        self,
+        state
+    ):
+        embed = self.actor(state)
+        actions = self.readout(embed)
+        return actions
+
+# streaming Q variant
+
+class StreamingQLambda(Module):
+    def __init__(
+        self,
+        network: Module
+    ):
+        super().__init__()
+        self.network = network
+
+        # sparse init
+
+        self.apply(self.init_)
+
+    def init_(self, module):
+        if not isinstance(module, Linear):
+            return
+
+        sparse_init_(module)
+
+    def update(
+        self,
+        state,
+        action,
+        next_state,
+        rewards
+    ):
+        raise NotImplementedError
+
+    def forward(
+        self,
+        state
+    ):
         raise NotImplementedError
 
 # sanity check
