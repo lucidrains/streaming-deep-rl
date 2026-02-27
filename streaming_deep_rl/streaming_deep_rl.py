@@ -14,6 +14,8 @@ from einops import einsum, rearrange, repeat, reduce, pack, unpack
 
 from adam_atan2_pytorch.adam_atan2_with_wasserstein_reg import Adam
 
+from hl_gauss_pytorch import HLGaussLayer
+
 from discrete_continuous_embed_readout import Readout
 
 # helpers
@@ -369,20 +371,35 @@ class StreamingACLambda(Module):
         actor: Module,
         critic: Module,
         dim_actor,
+        dim_critic,
         num_discrete_actions = None,
         num_continuous_actions = None,
         discount_factor = 0.999,
+        value_min = -5.,
+        value_max = 5.,
+        num_critic_bins = 32,
     ):
         super().__init__()
-        self.readout = Readout(dim_actor, 1)
+
+        # actor
 
         self.actor = actor
-        self.critic = critic
+        self.readout = Readout(dim_actor, 1)
 
         actor_with_readout = Sequential(actor, self.readout)
         self.actor_params = dict(actor_with_readout.named_parameters())
 
-        self.critic_params = dict(critic.named_parameters())
+        # critic
+
+        self.critic = critic
+        hl_gauss_layer = HLGaussLayer(dim_critic, hl_gauss_loss = dict(
+            min_value = value_min,
+            max_value = value_max,
+            num_bins = num_critic_bins
+        ))
+
+        critic_with_hl_gauss = Sequential(critic, hl_gauss_layer)
+        self.critic_params = dict(critic_with_hl_gauss.named_parameters())
 
         # state -> actions
 
@@ -394,7 +411,7 @@ class StreamingACLambda(Module):
         # state -> value
 
         def critic_forward(params, inputs):
-            return functional_call(self.critic, params, inputs)
+            return functional_call(critic_with_hl_gauss, params, inputs)
 
         self.critic_forward = critic_forward
         self.critic_backward = grad(critic_forward)
