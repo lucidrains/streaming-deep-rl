@@ -4,7 +4,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 from torch import nn, tensor, atan2, sqrt
-from torch.nn import Module, ModuleList, Linear, Sequential
+from torch.nn import Module, ModuleList, Linear, Sequential, ParameterDict
 
 from torch.optim.optimizer import Optimizer
 
@@ -18,6 +18,8 @@ from hl_gauss_pytorch import HLGaussLayer
 
 from discrete_continuous_embed_readout import Readout
 
+from torch_einops_utils import tree_map_tensor
+
 # helpers
 
 def exists(v):
@@ -25,6 +27,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def to_device(tree, device):
+    return tree_map_tensor(lambda t: t.to(device), tree)
 
 # initialization
 
@@ -375,6 +380,7 @@ class StreamingACLambda(Module):
         num_discrete_actions = None,
         num_continuous_actions = None,
         discount_factor = 0.999,
+        eligibility_trace_decay = 0.8,
         value_min = -5.,
         value_max = 5.,
         num_critic_bins = 32,
@@ -421,6 +427,14 @@ class StreamingACLambda(Module):
 
         self.discount_factor = discount_factor
 
+        # eligibility traces
+
+        self.actor_trace = {name: torch.zeros_like(param) for name, param in self.actor_params.items()}
+
+        self.critic_trace = {name: torch.zeros_like(param) for name, param in self.critic_params.items()}
+
+        self.eligibility_trace_decay = eligibility_trace_decay # lambda in paper
+
         # sparse init
 
         self.apply(self.init_)
@@ -431,6 +445,7 @@ class StreamingACLambda(Module):
 
         sparse_init_(module)
 
+    @torch.no_grad()
     def update(
         self,
         state,
@@ -445,12 +460,15 @@ class StreamingACLambda(Module):
 
         td_error = rewards + next_value_pred * self.discount_factor * (~is_terminal).float() - value_pred
 
+    @torch.no_grad()
     def forward_value(self, state):
         return self.critic_forward(self.critic_params, state)
 
+    @torch.no_grad()
     def forward_action(self, state):
         return self.actor_forward(self.actor_params, state)
 
+    @torch.no_grad()
     def forward(self, state):
         return self.forward_action(state)
 
