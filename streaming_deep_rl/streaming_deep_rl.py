@@ -2,11 +2,13 @@ from __future__ import annotations
 from typing import Callable
 
 import torch
+import torch.nn.functional as F
 from torch import nn, tensor, atan2, sqrt
-from torch.nn import Module, ModuleList, Linear
+from torch.nn import Module, ModuleList, Linear, Sequential
+
 from torch.optim.optimizer import Optimizer
 
-import torch.nn.functional as F
+from torch.func import functional_call, vmap, grad
 
 from einops import einsum, rearrange, repeat, reduce, pack, unpack
 
@@ -372,10 +374,30 @@ class StreamingACLambda(Module):
         discount_factor = 0.999,
     ):
         super().__init__()
+        self.readout = Readout(dim_actor, 1)
+
         self.actor = actor
         self.critic = critic
 
-        self.readout = Readout(dim_actor, 1)
+        actor_with_readout = Sequential(actor, self.readout)
+        self.actor_params = dict(actor_with_readout.named_parameters())
+
+        self.critic_params = dict(critic.named_parameters())
+
+        # state -> actions
+
+        def actor_forward(params, inputs):
+            return functional_call(actor_with_readout, params, inputs)
+
+        self.actor_forward = actor_forward
+
+        # state -> value
+
+        def critic_forward(params, inputs):
+            return functional_call(self.critic, params, inputs)
+
+        self.critic_forward = critic_forward
+        self.critic_backward = grad(critic_forward)
 
         # sparse init
 
@@ -396,13 +418,14 @@ class StreamingACLambda(Module):
     ):
         raise NotImplementedError
 
-    def forward(
-        self,
-        state
-    ):
-        embed = self.actor(state)
-        actions = self.readout(embed)
-        return actions
+    def forward_value(self, state):
+        return self.critic_forward(self.critic_params, state)
+
+    def forward_action(self, state):
+        return self.actor_forward(self.actor_params, state)
+
+    def forward(self, state):
+        return self.forward_action(state)
 
 # streaming Q variant
 

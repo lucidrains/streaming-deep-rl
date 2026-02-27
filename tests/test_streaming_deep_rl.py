@@ -27,4 +27,7 @@ def test_streaming():
     state = torch.randn(5,)
     actions = streaming_actor_critic(state)
 
+    value = streaming_actor_critic.forward_value(state)
+
     assert actions.shape == (1,)
+    assert value.shape == (1,)
