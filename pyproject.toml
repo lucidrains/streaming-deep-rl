@@ -25,24 +25,26 @@ classifiers=[
 
 dependencies = [
     "adam-atan2-pytorch>=0.1.1",
-    "einops>=0.8.0",
-    "gymnasium[box2d]>=1.0",
-    "torch>=2.0",
+    "discrete-continuous-embed-readout>=0.2.0",
+    "einops>=0.8.1",
+    "torch>=2.4",
 ]
 
 [project.urls]
 Homepage = "https://pypi.org/project/streaming-deep-rl/"
-Repository = "https://github.com/lucidrains/streaming-deep-rl"
+Repository = "https://codeberg.org/lucidrains/streaming-deep-rl"
 
 [project.optional-dependencies]
+
 examples = []
 test = [
+    "gymnasium[box2d]>=1.0",
     "pytest"
 ]
 
 [tool.pytest.ini_options]
 pythonpath = [
-  "."
+    "."
 ]
 
 [build-system]
@@ -58,3 +60,11 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["streaming_deep_rl"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "streaming_deep_rl",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
