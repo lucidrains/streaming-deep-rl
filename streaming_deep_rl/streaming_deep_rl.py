@@ -8,7 +8,7 @@ from torch.nn import Module, ModuleList, Linear, Sequential
 
 from torch.optim.optimizer import Optimizer
 
-from torch.func import functional_call, vmap, grad
+from torch.func import functional_call, vmap, grad, grad_and_value
 
 from einops import einsum, rearrange, repeat, reduce, pack, unpack
 
@@ -414,7 +414,12 @@ class StreamingACLambda(Module):
             return functional_call(critic_with_hl_gauss, params, inputs)
 
         self.critic_forward = critic_forward
-        self.critic_backward = grad(critic_forward)
+
+        self.critic_grad_and_value = grad_and_value(critic_forward)
+
+        # td related
+
+        self.discount_factor = discount_factor
 
         # sparse init
 
@@ -431,9 +436,14 @@ class StreamingACLambda(Module):
         state,
         action,
         next_state,
-        rewards
+        rewards,
+        is_terminal = tensor(False)
     ):
-        raise NotImplementedError
+        value_grad, value_pred = self.critic_grad_and_value(self.critic_params, state)
+
+        next_value_pred = self.forward_value(next_state)
+
+        td_error = rewards + next_value_pred * self.discount_factor * (~is_terminal).float() - value_pred
 
     def forward_value(self, state):
         return self.critic_forward(self.critic_params, state)

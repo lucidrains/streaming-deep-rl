@@ -32,3 +32,5 @@ def test_streaming():
 
     assert actions.shape == (1,)
     assert value.shape == ()
+
+    streaming_actor_critic.update(state, actions, state, 1.)
