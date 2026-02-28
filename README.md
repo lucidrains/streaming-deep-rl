@@ -6,9 +6,11 @@ Explorations into the proposed [Streaming Deep Reinforcement Learning](https://a
 
 Once completed, if it checks out, will reach to integrate the Stream Q(λ) with [Q-Transformer](https://github.com/lucidrains/q-transformer)
 
-The official repository can be found <a href="https://github.com/mohmdelsayed/streaming-drl">here</a>
+A recent testimony to Streaming AC(λ) variant can be found [here](https://blog.9600baud.net/streaming-deep-rl-honeypot.html). Will be incorporated into the repository as well with a few improvements.
 
-A recent testimony to the technique, specifically the Streaming AC(λ), can be found [here](https://blog.9600baud.net/streaming-deep-rl-honeypot.html). That will be incorporated into the repository as well with some improvements.
+[Paper reading](https://www.youtube.com/live/5NFAzluHkcY) by Youtube AI/ML educator [@hu-po](https://www.youtube.com/@hu-po)
+
+The official repository can be found <a href="https://github.com/mohmdelsayed/streaming-drl">here</a>
 
 ## Citations
 
