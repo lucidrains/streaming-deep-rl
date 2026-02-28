@@ -30,7 +30,7 @@ dependencies = [
     "hl-gauss-pytorch",
     "torch>=2.4",
     "torch-einops-utils",
-    "x-mlps-pytorch>=0.2.5"
+    "x-mlps-pytorch>=0.2.6"
 ]
 
 [project.urls]

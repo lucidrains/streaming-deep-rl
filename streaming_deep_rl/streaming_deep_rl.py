@@ -8,8 +8,6 @@ from torch.nn import Module, ModuleList, Linear, Sequential, ParameterDict
 
 from torch.optim.optimizer import Optimizer
 
-from torch.func import functional_call, vmap, grad, grad_and_value
-
 from einops import einsum, rearrange, repeat, reduce, pack, unpack
 
 from hl_gauss_pytorch import HLGaussLayer
@@ -214,7 +212,6 @@ class StreamingACLambda(Module):
         critic: Module,
         dim_state,
         dim_actor,
-        dim_critic,
         num_discrete_actions = 0,
         num_continuous_actions = 0,
         discount_factor = 0.999,
@@ -223,9 +220,6 @@ class StreamingACLambda(Module):
         critic_kappa = 2.,
         actor_lr = 1e-4,
         critic_lr = 1e-4,
-        value_min = -3.,
-        value_max = 3.,
-        num_critic_bins = 32,
         entropy_weight = 0.01,
         init_sparsity = 0.9
     ):
@@ -250,44 +244,11 @@ class StreamingACLambda(Module):
             num_continuous = num_continuous_actions
         )
 
-        actor_with_readout = Sequential(actor, self.readout)
-        self.actor_params = dict(actor_with_readout.named_parameters())
+        self.actor_with_readout = Sequential(actor, self.readout)
 
         # critic
 
         self.critic = critic
-        hl_gauss_layer = HLGaussLayer(dim_critic, hl_gauss_loss = dict(
-            min_value = value_min,
-            max_value = value_max,
-            num_bins = num_critic_bins
-        ))
-
-        critic_with_hl_gauss = Sequential(critic, hl_gauss_layer)
-        self.critic_params = dict(critic_with_hl_gauss.named_parameters())
-
-        # state -> actions
-
-        def actor_forward(params, inputs):
-            return functional_call(actor_with_readout, params, inputs)
-
-        self.actor_forward = actor_forward
-
-        def actor_forward_log_prob(params, inputs):
-            states, actions = inputs
-            action_logits = functional_call(actor_with_readout, params, states)
-            log_prob = self.readout.log_prob(action_logits, actions)
-            return log_prob.mean()
-
-        self.actor_grad = grad(actor_forward_log_prob)
-
-        # state -> value
-
-        def critic_forward(params, inputs):
-            return functional_call(critic_with_hl_gauss, params, inputs)
-
-        self.critic_forward = critic_forward
-
-        self.critic_grad_and_value = grad_and_value(critic_forward)
 
         # td related
 
@@ -299,9 +260,9 @@ class StreamingACLambda(Module):
 
         # eligibility traces
 
-        self.actor_trace = {name: torch.zeros_like(param) for name, param in self.actor_params.items()}
+        self.actor_trace = {name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()}
 
-        self.critic_trace = {name: torch.zeros_like(param) for name, param in self.critic_params.items()}
+        self.critic_trace = {name: torch.zeros_like(param) for name, param in self.critic.named_parameters()}
 
         self.eligibility_trace_decay = eligibility_trace_decay # lambda in paper
 
@@ -343,13 +304,25 @@ class StreamingACLambda(Module):
 
         normed_reward = self.reward_norm(reward, is_terminal = is_terminal, update = True)
 
-        # get value grad and prediction
+        # get value prediction and grad
 
-        value_grad, value_pred = self.critic_grad_and_value(self.critic_params, state)
+        with torch.enable_grad():
+            value_pred = self.critic(state).mean()
 
-        actor_grad = self.actor_grad(self.actor_params, (state, action))
+            # actor grad
 
-        next_value_pred = self.forward_value(next_state)
+            action_logits = self.actor_with_readout(state)
+            log_prob = self.readout.log_prob(action_logits, action).mean()
+
+            actor_grads = torch.autograd.grad(log_prob, self.actor_with_readout.parameters())
+            actor_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), actor_grads)}
+
+            # critic grad
+
+            critic_grads = torch.autograd.grad(value_pred, self.critic.parameters())
+            value_grad = {name: grad for (name, _), grad in zip(self.critic.named_parameters(), critic_grads)}
+
+        next_value_pred = self.forward_value(next_state).mean()
 
         assert isinstance(reward, (int, float)) or reward.numel() == 1
 
@@ -379,17 +352,17 @@ class StreamingACLambda(Module):
 
         # update actor params
 
-        for name, param in self.actor_params.items():
+        for name, param in self.actor_with_readout.named_parameters():
             actor_trace = self.actor_trace[name]
             update = td_error  * actor_trace * scale_actor
-            param.add_(update)
+            param.data.add_(update)
 
         # update critic params
 
-        for name, param in self.critic_params.items():
+        for name, param in self.critic.named_parameters():
             critic_trace = self.critic_trace[name]
             update = td_error * critic_trace * scale_critic
-            param.add_(update)
+            param.data.add_(update)
 
         # finally update state norm statistics, with state
 
@@ -398,12 +371,12 @@ class StreamingACLambda(Module):
     @torch.no_grad()
     def forward_value(self, state):
         state = self.state_norm(state, update = False)
-        return self.critic_forward(self.critic_params, state)
+        return self.critic(state)
 
     @torch.no_grad()
     def forward_action(self, state):
         state = self.state_norm(state, update = False)
-        return self.actor_forward(self.actor_params, state)
+        return self.actor_with_readout(state)
 
     @torch.no_grad()
     def forward(self, state):
