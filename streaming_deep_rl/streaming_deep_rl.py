@@ -381,6 +381,8 @@ class StreamingACLambda(Module):
         num_continuous_actions = 0,
         discount_factor = 0.999,
         eligibility_trace_decay = 0.8,
+        actor_lr = 1e-4,
+        critic_lr = 1e-4,
         value_min = -5.,
         value_max = 5.,
         num_critic_bins = 32,
@@ -450,6 +452,11 @@ class StreamingACLambda(Module):
 
         self.eligibility_trace_decay = eligibility_trace_decay # lambda in paper
 
+        # learning rates
+
+        self.actor_lr = actor_lr
+        self.critic_lr = critic_lr
+
         # sparse init
 
         self.apply(self.init_)
@@ -488,6 +495,20 @@ class StreamingACLambda(Module):
 
         for name, trace in self.critic_trace.items():
             trace.mul_(decay).add_(value_grad[name])
+
+        # update actor params
+
+        for name, param in self.actor_params.items():
+            actor_trace = self.actor_trace[name]
+            update = td_error * self.actor_lr * actor_trace
+            param.add_(update)
+
+        # update critic params
+
+        for name, param in self.critic_params.items():
+            critic_trace
+            update = td_error * self.critic_lr * critic_trace
+            param.add_(update)
 
     @torch.no_grad()
     def forward_value(self, state):
