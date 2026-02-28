@@ -112,7 +112,7 @@ def main(
     eligibility_trace_decay = 0.8,
     use_wandb = False,
     render = False,
-    render_every_eps = 100,
+    render_every_eps = 250,
     clear_videos = False,
     cpu = True
 ):

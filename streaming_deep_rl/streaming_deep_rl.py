@@ -16,6 +16,8 @@ from discrete_continuous_embed_readout import Readout
 
 from torch_einops_utils import tree_map_tensor
 
+from ema_pytorch import EMA
+
 # helpers
 
 def exists(v):
@@ -220,6 +222,7 @@ class StreamingACLambda(Module):
         critic_kappa = 2.,
         actor_lr = 1e-4,
         critic_lr = 1e-4,
+        critic_ema_beta = 0.95,
         entropy_weight = 0.01,
         init_sparsity = 0.9
     ):
@@ -249,6 +252,8 @@ class StreamingACLambda(Module):
         # critic
 
         self.critic = critic
+
+        self.critic_ema = EMA(critic, beta = critic_ema_beta)
 
         # td related
 
@@ -307,6 +312,9 @@ class StreamingACLambda(Module):
         reward = cast_tensor(reward)
         is_terminal = cast_tensor(is_terminal)
 
+        state = self.state_norm(state, update = True)
+        next_state = self.state_norm(next_state, update = False)
+
         # normalize the rewards
 
         normed_reward = self.reward_norm(reward, is_terminal = is_terminal, update = True)
@@ -329,7 +337,7 @@ class StreamingACLambda(Module):
             critic_grads = torch.autograd.grad(value_pred, self.critic.parameters())
             value_grad = {name: grad for (name, _), grad in zip(self.critic.named_parameters(), critic_grads)}
 
-        next_value_pred = self.forward_value(next_state).mean()
+        next_value_pred = self.critic_ema(next_state).mean()
 
         assert isinstance(reward, (int, float)) or reward.numel() == 1
 
@@ -371,13 +379,10 @@ class StreamingACLambda(Module):
             update = td_error * critic_trace * scale_critic * self.critic_lr
             param.data.add_(update)
 
-        # finally update state norm statistics, with state
-
-        self.state_norm(state, update = True)
+        self.critic_ema.update()
 
     @torch.no_grad()
     def forward_value(self, state):
-        state = self.state_norm(state, update = False)
         return self.critic(state)
 
     @torch.no_grad()
