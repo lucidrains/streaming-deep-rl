@@ -222,6 +222,8 @@ class StreamingACLambda(Module):
         critic_kappa = 2.,
         actor_lr = 1e-4,
         critic_lr = 1e-4,
+        actor_use_ema = True,
+        actor_ema_beta = 0.95,
         critic_ema_beta = 0.95,
         entropy_weight = 0.01,
         init_sparsity = 0.9
@@ -248,6 +250,9 @@ class StreamingACLambda(Module):
         )
 
         self.actor_with_readout = Sequential(actor, self.readout)
+
+        self.actor_use_ema = actor_use_ema
+        self.actor_with_readout_ema = EMA(self.actor_with_readout, beta = actor_ema_beta) if actor_use_ema else None
 
         # critic
 
@@ -372,6 +377,9 @@ class StreamingACLambda(Module):
             update = td_error  * actor_trace * scale_actor * self.actor_lr
             param.data.add_(update)
 
+        if exists(self.actor_use_ema):
+            self.actor_with_readout_ema.update()
+
         # update critic params
 
         for name, param in self.critic.named_parameters():
@@ -386,9 +394,12 @@ class StreamingACLambda(Module):
         return self.critic(state)
 
     @torch.no_grad()
-    def forward_action(self, state):
+    def forward_action(self, state, use_ema = True):
         state = self.state_norm(state, update = False)
-        return self.actor_with_readout(state)
+
+        actor = self.actor_with_readout_ema if use_ema and self.actor_use_ema else self.actor_with_readout
+
+        return actor(state)
 
     def sample_action(self, action_dist):
         return self.readout.sample(action_dist)
