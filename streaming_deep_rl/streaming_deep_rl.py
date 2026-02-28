@@ -377,8 +377,8 @@ class StreamingACLambda(Module):
         critic: Module,
         dim_actor,
         dim_critic,
-        num_discrete_actions = None,
-        num_continuous_actions = None,
+        num_discrete_actions = 0,
+        num_continuous_actions = 0,
         discount_factor = 0.999,
         eligibility_trace_decay = 0.8,
         value_min = -5.,
@@ -390,7 +390,14 @@ class StreamingACLambda(Module):
         # actor
 
         self.actor = actor
-        self.readout = Readout(dim_actor, 1)
+
+        assert num_discrete_actions > 0 or num_continuous_actions > 0
+
+        self.readout = Readout(
+            dim_actor,
+            num_discrete = num_discrete_actions,
+            num_continuous = num_continuous_actions
+        )
 
         actor_with_readout = Sequential(actor, self.readout)
         self.actor_params = dict(actor_with_readout.named_parameters())
@@ -413,6 +420,14 @@ class StreamingACLambda(Module):
             return functional_call(actor_with_readout, params, inputs)
 
         self.actor_forward = actor_forward
+
+        def actor_forward_log_prob(params, inputs):
+            states, actions = inputs
+            action_logits = functional_call(actor_with_readout, params, states)
+            log_prob = self.readout.log_prob(action_logits, actions)
+            return log_prob.mean()
+
+        self.actor_grad = grad(actor_forward_log_prob)
 
         # state -> value
 
@@ -456,9 +471,23 @@ class StreamingACLambda(Module):
     ):
         value_grad, value_pred = self.critic_grad_and_value(self.critic_params, state)
 
+        actor_grad = self.actor_grad(self.actor_params, (state, action))
+
         next_value_pred = self.forward_value(next_state)
 
         td_error = rewards + next_value_pred * self.discount_factor * (~is_terminal).float() - value_pred
+
+        # update actor eligibility trace
+
+        decay = self.eligibility_trace_decay * self.discount_factor
+
+        for name, trace in self.actor_trace.items():
+            trace.mul_(decay).add_(actor_grad[name])
+
+        # update critic eligibility trace
+
+        for name, trace in self.critic_trace.items():
+            trace.mul_(decay).add_(value_grad[name])
 
     @torch.no_grad()
     def forward_value(self, state):
