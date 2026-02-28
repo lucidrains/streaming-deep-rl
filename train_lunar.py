@@ -114,7 +114,8 @@ def main(
     render = False,
     render_every_eps = 250,
     clear_videos = False,
-    cpu = True
+    cpu = True,
+    adaptive = False
 ):
     if clear_videos:
         rmtree(VIDEO_FOLDER, ignore_errors = True)
@@ -184,6 +185,7 @@ def main(
         actor_lr = actor_lr,
         critic_lr = critic_lr,
         entropy_weight = entropy_weight,
+        adaptive = adaptive,
         discount_factor = discount_factor,
         eligibility_trace_decay = eligibility_trace_decay
     )

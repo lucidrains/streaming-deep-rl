@@ -27,7 +27,6 @@ dependencies = [
     "discrete-continuous-embed-readout>=0.2.0",
     "einops>=0.8.1",
     "ema-pytorch",
-    "hl-gauss-pytorch",
     "torch>=2.4",
     "torch-einops-utils",
     "x-mlps-pytorch>=0.2.6"

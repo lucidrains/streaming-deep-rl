@@ -4,19 +4,17 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 from torch import nn, tensor, is_tensor, atan2, sqrt
-from torch.nn import Module, ModuleList, Linear, Sequential, ParameterDict
-
-from torch.optim.optimizer import Optimizer
+from torch.nn import Module, Linear, Sequential
 
 from einops import einsum, rearrange, repeat, reduce, pack, unpack
-
-from hl_gauss_pytorch import HLGaussLayer
 
 from discrete_continuous_embed_readout import Readout
 
 from torch_einops_utils import tree_map_tensor
 
 from ema_pytorch import EMA
+
+from streaming_deep_rl.buffer_dict import BufferDict
 
 # helpers
 
@@ -222,6 +220,9 @@ class StreamingACLambda(Module):
         critic_kappa = 2.,
         actor_lr = 1e-4,
         critic_lr = 1e-4,
+        adaptive = False,
+        rms_beta = 0.99,
+        eps = 1e-5,
         actor_use_ema = True,
         actor_ema_beta = 0.95,
         critic_ema_beta = 0.95,
@@ -270,13 +271,20 @@ class StreamingACLambda(Module):
 
         # eligibility traces
 
-        self.actor_trace = {name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()}
+        self.actor_trace = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
+        self.critic_trace = BufferDict({name: torch.zeros_like(param) for name, param in self.critic.named_parameters()})
 
-        self.critic_trace = {name: torch.zeros_like(param) for name, param in self.critic.named_parameters()}
+        self.adaptive = adaptive
+        self.rms_beta = rms_beta
+        self.eps = eps
+
+        if adaptive:
+            self.actor_v = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
+            self.critic_v = BufferDict({name: torch.zeros_like(param) for name, param in self.critic.named_parameters()})
 
         self.eligibility_trace_decay = eligibility_trace_decay # lambda in paper
 
-        # adaptive step related (obsgd)
+        # adaptive step related (obgd)
 
         self.actor_kappa = actor_kappa
         self.critic_kappa = critic_kappa
@@ -304,6 +312,13 @@ class StreamingACLambda(Module):
 
         for trace in self.critic_trace.values():
             trace.zero_()
+
+        if self.adaptive:
+            for v in self.actor_v.values():
+                v.zero_()
+
+            for v in self.critic_v.values():
+                v.zero_()
 
     @torch.no_grad()
     def update(
@@ -347,6 +362,22 @@ class StreamingACLambda(Module):
         assert isinstance(reward, (int, float)) or reward.numel() == 1
 
         td_error = normed_reward + next_value_pred * self.discount_factor * (~is_terminal).float() - value_pred
+        td_error_sign = td_error.sign()
+
+        # actor grad with entropy regularization (Appendix E)
+
+        with torch.enable_grad():
+            action_logits = self.actor_with_readout(state)
+            log_prob = self.readout.log_prob(action_logits, action).mean()
+
+            entropy = self.readout.entropy(action_logits).mean()
+
+            total_actor_loss = log_prob + self.entropy_weight * td_error_sign * entropy
+
+            actor_grads = torch.autograd.grad(total_actor_loss, self.actor_with_readout.parameters())
+            actor_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), actor_grads)}
+
+        value_pred = value_pred.detach()
 
         # update actor eligibility trace
 
@@ -362,30 +393,42 @@ class StreamingACLambda(Module):
 
         # overstepping-bounds gradient descent related
 
-        actor_trace_l1norm = sum([trace.norm(p = 1) for trace in self.actor_trace.values()])
-        critic_trace_l1norm = sum([trace.norm(p = 1) for trace in self.critic_trace.values()])
+        td_error_factor = td_error.abs().clamp(min = 1.)
 
-        td_error_factor = td_error.abs().clamp(min = 1.) # if td is small, should not influence
+        def update_params(params, traces, vs, kappa, lr):
+            if self.adaptive:
+                for name, v in vs.items():
+                    v.mul_(self.rms_beta).add_((td_error * traces[name]) ** 2, alpha = 1 - self.rms_beta)
 
-        scale_actor = (self.actor_kappa * td_error_factor * actor_trace_l1norm).reciprocal().clamp(max = 1.)
-        scale_critic = (self.critic_kappa * td_error_factor * critic_trace_l1norm).reciprocal().clamp(max = 1.)
+                adapted_traces = {name: trace / (vs[name] + self.eps).sqrt() for name, trace in traces.items()}
+            else:
+                adapted_traces = traces
 
-        # update actor params
+            trace_norm = sum([trace.norm(p = 1) for trace in adapted_traces.values()])
+            scale = (kappa * td_error_factor * trace_norm).reciprocal().clamp(max = 1.)
 
-        for name, param in self.actor_with_readout.named_parameters():
-            actor_trace = self.actor_trace[name]
-            update = td_error  * actor_trace * scale_actor * self.actor_lr
-            param.data.add_(update)
+            for name, param in params.named_parameters():
+                update = td_error * adapted_traces[name] * scale * lr
+                param.data.add_(update)
 
-        if exists(self.actor_use_ema):
+        update_params(
+            self.actor_with_readout,
+            self.actor_trace,
+            self.actor_v if self.adaptive else None,
+            self.actor_kappa,
+            self.actor_lr
+        )
+
+        update_params(
+            self.critic,
+            self.critic_trace,
+            self.critic_v if self.adaptive else None,
+            self.critic_kappa,
+            self.critic_lr
+        )
+
+        if self.actor_use_ema:
             self.actor_with_readout_ema.update()
-
-        # update critic params
-
-        for name, param in self.critic.named_parameters():
-            critic_trace = self.critic_trace[name]
-            update = td_error * critic_trace * scale_critic * self.critic_lr
-            param.data.add_(update)
 
         self.critic_ema.update()
 
