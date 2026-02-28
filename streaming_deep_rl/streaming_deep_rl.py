@@ -347,21 +347,21 @@ class StreamingACLambda(Module):
 
         td_error_factor = td_error.abs().clamp(min = 1.) # if td is small, should not influence
 
-        scale_actor = (self.actor_lr * self.actor_kappa * td_error_factor * actor_trace_l1norm).reciprocal().clamp(max = 1.)
-        scale_critic = (self.critic_lr * self.critic_kappa * td_error_factor * critic_trace_l1norm).reciprocal().clamp(max = 1.)
+        scale_actor = (self.actor_kappa * td_error_factor * actor_trace_l1norm).reciprocal().clamp(max = 1.)
+        scale_critic = (self.critic_kappa * td_error_factor * critic_trace_l1norm).reciprocal().clamp(max = 1.)
 
         # update actor params
 
         for name, param in self.actor_with_readout.named_parameters():
             actor_trace = self.actor_trace[name]
-            update = td_error  * actor_trace * scale_actor
+            update = td_error  * actor_trace * scale_actor * self.actor_lr
             param.data.add_(update)
 
         # update critic params
 
         for name, param in self.critic.named_parameters():
             critic_trace = self.critic_trace[name]
-            update = td_error * critic_trace * scale_critic
+            update = td_error * critic_trace * scale_critic * self.critic_lr
             param.data.add_(update)
 
         # finally update state norm statistics, with state
