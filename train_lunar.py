@@ -1,16 +1,14 @@
 # /// script
 # dependencies = [
+#   "accelerate",
 #   "torch",
 #   "einops",
-#   "gymnasium[box2d]",
+#   "gymnasium[box2d,other]",
 #   "fire",
 #   "tqdm",
-#   "wandb",
-#   "discrete-continuous-embed-readout",
-#   "torch-einops-utils",
-#   "x-mlps-pytorch",
-#   "accelerate",
+#   "streaming-deep-rl>=0.0.9",
 #   "rich",
+#   "wandb"
 # ]
 # ///
 
@@ -77,10 +75,21 @@ class Dashboard:
             "avg_reward_100": 0.0,
             "avg_steps_100": 0.0,
             "last_eps_reward": 0.0,
-            "last_eps_steps": 0
+            "last_eps_steps": 0,
+            "td_error": "0.0000",
+            "value_pred": "0.0000",
+            "actor_grad": "0.0000",
+            "actor_norm": "0.0000",
+            "actor_scale": "0.0000",
+            "critic_grad": "0.0000",
+            "critic_norm": "0.0000",
+            "critic_scale": "0.0000"
         }
 
     def update_episode_info(self, **kwargs):
+        self.episode_info.update(kwargs)
+
+    def update_diagnostics(self, **kwargs):
         self.episode_info.update(kwargs)
 
     def advance_progress(self):
@@ -230,12 +239,23 @@ def main(
                 
                 # update
 
-                agent.update(
+                metrics = agent.update(
                     state = state, 
                     action = action, 
                     next_state = next_state, 
                     reward = reward_t, 
                     is_terminal = is_terminal
+                )
+                
+                dashboard.update_diagnostics(
+                    td_error = f"{metrics['td_error']:.4f}",
+                    value_pred = f"{metrics['value_pred']:.4f}",
+                    actor_grad = f"{metrics['actor_grad_norm']:.4e}",
+                    actor_norm = f"{metrics['actor_trace_norm']:.4f}",
+                    actor_scale = f"{metrics['actor_scale']:.4e}",
+                    critic_grad = f"{metrics['critic_grad_norm']:.4e}",
+                    critic_norm = f"{metrics['critic_trace_norm']:.4f}",
+                    critic_scale = f"{metrics['critic_scale']:.4e}"
                 )
                 
                 state = next_state

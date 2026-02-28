@@ -75,10 +75,10 @@ class ObservationNormalizer(Module):
 
         self.register_buffer('step', tensor(1))
         self.register_buffer('running_mean', torch.zeros(dim))
-        self.register_buffer('running_estimate_p', torch.ones(dim))
+        self.register_buffer('running_estimate_p', torch.zeros(dim))
 
     def reset_step(self):
-        self.step.zero_()
+        self.step.fill_(1)
 
     @property
     def time(self):
@@ -88,10 +88,10 @@ class ObservationNormalizer(Module):
     def variance(self):
         p = self.running_estimate_p
 
-        if self.step.item() == 1:
+        if self.step.item() <= 1:
             return torch.ones_like(p)
 
-        return (p / (self.time - 1. / self.time_dilate_factor))
+        return (p / (self.time - 1. / self.time_dilate_factor)).clamp(min = self.eps)
 
     def forward(
         self,
@@ -144,12 +144,12 @@ class ScaleRewardNormalizer(Module):
         self.time_dilate_factor = time_dilate_factor
         self.mean_center = mean_center
 
-        self.register_buffer('step', tensor(0))
+        self.register_buffer('step', tensor(1))
         self.register_buffer('running_reward', tensor(0.))
         self.register_buffer('running_estimate_p', tensor(0.))
 
     def reset_step(self):
-        self.step.zero_()
+        self.step.fill_(1)
 
     @property
     def time(self):
@@ -159,10 +159,10 @@ class ScaleRewardNormalizer(Module):
     def variance(self):
         p = self.running_estimate_p
 
-        if self.step.item() == 1:
+        if self.step.item() <= 1:
             return torch.ones_like(p)
 
-        return (p / (self.time - 1. / self.time_dilate_factor))
+        return (p / (self.time - 1. / self.time_dilate_factor)).clamp(min = self.eps)
 
     def forward(
         self,
@@ -320,7 +320,6 @@ class StreamingACLambda(Module):
             for v in self.critic_v.values():
                 v.zero_()
 
-    @torch.no_grad()
     def update(
         self,
         state,
@@ -339,42 +338,31 @@ class StreamingACLambda(Module):
 
         normed_reward = self.reward_norm(reward, is_terminal = is_terminal, update = True)
 
-        # get value prediction and grad
+        # all gradient related
 
         with torch.enable_grad():
+            # critic pred and grad
+
             value_pred = self.critic(state).mean()
 
-            # actor grad
-
-            action_logits = self.actor_with_readout(state)
-            log_prob = self.readout.log_prob(action_logits, action).mean()
-
-            actor_grads = torch.autograd.grad(log_prob, self.actor_with_readout.parameters())
-            actor_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), actor_grads)}
-
-            # critic grad
-
-            critic_grads = torch.autograd.grad(value_pred, self.critic.parameters())
+            critic_params = list(self.critic.parameters())
+            critic_grads = torch.autograd.grad(value_pred, critic_params)
             value_grad = {name: grad for (name, _), grad in zip(self.critic.named_parameters(), critic_grads)}
 
-        next_value_pred = self.critic_ema(next_state).mean()
+            # actor grad with entropy regularization (Appendix E)
 
-        assert isinstance(reward, (int, float)) or reward.numel() == 1
+            next_value_pred = self.critic_ema(next_state).mean()
+            td_error = normed_reward + next_value_pred * self.discount_factor * (~is_terminal).float() - value_pred
+            td_error_sign = td_error.detach().sign()
 
-        td_error = normed_reward + next_value_pred * self.discount_factor * (~is_terminal).float() - value_pred
-        td_error_sign = td_error.sign()
-
-        # actor grad with entropy regularization (Appendix E)
-
-        with torch.enable_grad():
             action_logits = self.actor_with_readout(state)
             log_prob = self.readout.log_prob(action_logits, action).mean()
-
             entropy = self.readout.entropy(action_logits).mean()
 
             total_actor_loss = log_prob + self.entropy_weight * td_error_sign * entropy
 
-            actor_grads = torch.autograd.grad(total_actor_loss, self.actor_with_readout.parameters())
+            actor_params = list(self.actor_with_readout.parameters())
+            actor_grads = torch.autograd.grad(total_actor_loss, actor_params)
             actor_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), actor_grads)}
 
         value_pred = value_pred.detach()
@@ -395,6 +383,9 @@ class StreamingACLambda(Module):
 
         td_error_factor = td_error.abs().clamp(min = 1.)
 
+        actor_grad_norm = torch.stack([g.norm(p=1) for g in actor_grad.values()]).mean()
+        critic_grad_norm = torch.stack([g.norm(p=1) for g in value_grad.values()]).mean()
+
         def update_params(params, traces, vs, kappa, lr):
             if self.adaptive:
                 for name, v in vs.items():
@@ -404,14 +395,15 @@ class StreamingACLambda(Module):
             else:
                 adapted_traces = traces
 
-            trace_norm = sum([trace.norm(p = 1) for trace in adapted_traces.values()])
+            trace_norm = torch.stack([trace.norm(p = 1) for trace in adapted_traces.values()]).mean()
             scale = (kappa * td_error_factor * trace_norm).reciprocal().clamp(max = 1.)
 
             for name, param in params.named_parameters():
                 update = td_error * adapted_traces[name] * scale * lr
                 param.data.add_(update)
+            return trace_norm, scale
 
-        update_params(
+        actor_trace_norm, actor_scale = update_params(
             self.actor_with_readout,
             self.actor_trace,
             self.actor_v if self.adaptive else None,
@@ -419,7 +411,7 @@ class StreamingACLambda(Module):
             self.actor_lr
         )
 
-        update_params(
+        critic_trace_norm, critic_scale = update_params(
             self.critic,
             self.critic_trace,
             self.critic_v if self.adaptive else None,
@@ -431,6 +423,17 @@ class StreamingACLambda(Module):
             self.actor_with_readout_ema.update()
 
         self.critic_ema.update()
+
+        return dict(
+            td_error = td_error.item(),
+            value_pred = value_pred.item(),
+            actor_grad_norm = actor_grad_norm.item(),
+            actor_trace_norm = actor_trace_norm.item(),
+            actor_scale = actor_scale.item(),
+            critic_grad_norm = critic_grad_norm.item(),
+            critic_trace_norm = critic_trace_norm.item(),
+            critic_scale = critic_scale.item()
+        )
 
     @torch.no_grad()
     def forward_value(self, state):
