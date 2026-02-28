@@ -14,9 +14,9 @@ def test_streaming():
 
     from x_mlps_pytorch.normed_mlp import MLP
 
-    actor = MLP(5, 128, norm_elementwise_affine = False, activate_last = True)
+    actor = MLP(5, 128, norm_elementwise_affine = False, activate_last = False)
 
-    critic = MLP(5, 128, 1, norm_elementwise_affine = False, activate_last = True)
+    critic = MLP(5, 1, norm_elementwise_affine = False, activate_last = False)
 
     streaming_actor_critic = StreamingACLambda(
         actor = actor,
@@ -31,6 +31,7 @@ def test_streaming():
 
     value = streaming_actor_critic.forward_value(state)
 
+    assert (value > 0).all()
     assert action_dist_params.shape == (1, 2)
     assert value.shape == (1,)
 
