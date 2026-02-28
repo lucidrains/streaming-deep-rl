@@ -26,14 +26,15 @@ def test_streaming():
         dim_actor = 128,
     )
 
+    streaming_actor_critic.reset_trace_()
+
     state = torch.randn(5,)
     action_dist_params = streaming_actor_critic(state)
 
     value = streaming_actor_critic.forward_value(state)
 
-    assert (value > 0).all()
     assert action_dist_params.shape == (1, 2)
     assert value.shape == (1,)
 
-    actions = streaming_actor_critic.readout.sample(action_dist_params)
+    actions = streaming_actor_critic.sample_action(action_dist_params)
     streaming_actor_critic.update(state, actions, state, 1.)

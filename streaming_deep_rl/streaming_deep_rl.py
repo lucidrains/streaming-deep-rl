@@ -288,6 +288,13 @@ class StreamingACLambda(Module):
 
         sparse_init_(module, sparsity = self.init_sparsity)
 
+    def reset_trace_(self):
+        for trace in self.actor_trace.values():
+            trace.zero_()
+
+        for trace in self.critic_trace.values():
+            trace.zero_()
+
     @torch.no_grad()
     def update(
         self,
@@ -377,6 +384,9 @@ class StreamingACLambda(Module):
     def forward_action(self, state):
         state = self.state_norm(state, update = False)
         return self.actor_with_readout(state)
+
+    def sample_action(self, action_dist):
+        return self.readout.sample(action_dist)
 
     @torch.no_grad()
     def forward(self, state):

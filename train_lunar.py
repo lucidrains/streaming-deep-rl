@@ -209,11 +209,7 @@ def main(
             
             # reset eligibility traces
 
-            for trace in agent.actor_trace.values():
-                trace.zero_()
-
-            for trace in agent.critic_trace.values():
-                trace.zero_()
+            agent.reset_trace_()
 
             for timestep in range(max_timesteps):
                 
