@@ -20,6 +20,8 @@ from discrete_continuous_embed_readout import Readout
 
 from torch_einops_utils import tree_map_tensor
 
+from einops import pack
+
 # helpers
 
 def exists(v):
@@ -381,11 +383,14 @@ class StreamingACLambda(Module):
         num_continuous_actions = 0,
         discount_factor = 0.999,
         eligibility_trace_decay = 0.8,
+        actor_kappa = 3.,
+        critic_kappa = 2.,
         actor_lr = 1e-4,
         critic_lr = 1e-4,
         value_min = -5.,
         value_max = 5.,
         num_critic_bins = 32,
+        entropy_weight = 0.01
     ):
         super().__init__()
 
@@ -444,6 +449,10 @@ class StreamingACLambda(Module):
 
         self.discount_factor = discount_factor
 
+        # entropy related
+
+        self.entropy_weight = entropy_weight
+
         # eligibility traces
 
         self.actor_trace = {name: torch.zeros_like(param) for name, param in self.actor_params.items()}
@@ -451,6 +460,11 @@ class StreamingACLambda(Module):
         self.critic_trace = {name: torch.zeros_like(param) for name, param in self.critic_params.items()}
 
         self.eligibility_trace_decay = eligibility_trace_decay # lambda in paper
+
+        # adaptive step related (obsgd)
+
+        self.actor_kappa = actor_kappa
+        self.critic_kappa = critic_kappa
 
         # learning rates
 
@@ -473,7 +487,7 @@ class StreamingACLambda(Module):
         state,
         action,
         next_state,
-        rewards,
+        reward,
         is_terminal = tensor(False)
     ):
         value_grad, value_pred = self.critic_grad_and_value(self.critic_params, state)
@@ -482,7 +496,9 @@ class StreamingACLambda(Module):
 
         next_value_pred = self.forward_value(next_state)
 
-        td_error = rewards + next_value_pred * self.discount_factor * (~is_terminal).float() - value_pred
+        assert isinstance(reward, (int, float)) or reward.numel() == 1
+
+        td_error = reward + next_value_pred * self.discount_factor * (~is_terminal).float() - value_pred
 
         # update actor eligibility trace
 
@@ -491,23 +507,35 @@ class StreamingACLambda(Module):
         for name, trace in self.actor_trace.items():
             trace.mul_(decay).add_(actor_grad[name])
 
+
         # update critic eligibility trace
 
         for name, trace in self.critic_trace.items():
             trace.mul_(decay).add_(value_grad[name])
 
+        # obsgd related - adaptive step afaict
+
+        actor_trace_l1norm = sum([trace.norm(p = 1) for trace in self.actor_trace.values()])
+        critic_trace_l1norm = sum([trace.norm(p = 1) for trace in self.critic_trace.values()])
+
+        td_error_factor = td_error.abs().clamp(min = 1.) # if td is small, should not influence
+
+        scale_actor = 1. / (self.actor_kappa * td_error_factor * actor_trace_l1norm).clamp(min = 1.)
+        scale_critic = 1. / (self.critic_kappa * td_error_factor * critic_trace_l1norm).clamp(min = 1.)
+
         # update actor params
 
         for name, param in self.actor_params.items():
+
             actor_trace = self.actor_trace[name]
-            update = td_error * self.actor_lr * actor_trace
+            update = td_error * self.actor_lr * actor_trace * scale_actor
             param.add_(update)
 
         # update critic params
 
         for name, param in self.critic_params.items():
-            critic_trace
-            update = td_error * self.critic_lr * critic_trace
+            critic_trace = self.critic_trace[name]
+            update = td_error * self.critic_lr * critic_trace * scale_critic
             param.add_(update)
 
     @torch.no_grad()
