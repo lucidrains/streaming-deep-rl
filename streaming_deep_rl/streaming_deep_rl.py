@@ -3,7 +3,7 @@ from typing import Callable
 
 import torch
 import torch.nn.functional as F
-from torch import nn, tensor, atan2, sqrt
+from torch import nn, tensor, is_tensor, atan2, sqrt
 from torch.nn import Module, ModuleList, Linear, Sequential, ParameterDict
 
 from torch.optim.optimizer import Optimizer
@@ -25,6 +25,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def cast_tensor(t):
+    return tensor(t) if not is_tensor(t) else t
 
 def to_device(tree, device):
     return tree_map_tensor(lambda t: t.to(device), tree)
@@ -55,7 +58,7 @@ def sparse_init_(
 
 # online normalization from Welford in 1962
 
-class NormalizeObservation(Module):
+class ObservationNormalizer(Module):
     """
     Algorithm 6 in https://arxiv.org/abs/2410.14606
     """
@@ -94,11 +97,14 @@ class NormalizeObservation(Module):
 
     def forward(
         self,
-        obs
+        obs,
+        update = None
     ):
         normalized = (obs - self.running_mean) / self.variance.clamp(min = self.eps).sqrt()
 
-        if not self.training:
+        update = default(update, self.training)
+
+        if not update:
             return normalized
 
         time = self.time.item()
@@ -122,7 +128,7 @@ class NormalizeObservation(Module):
 
         return normalized
 
-class ScaleReward(Module):
+class ScaleRewardNormalizer(Module):
     """
     Algorithm 5
     """
@@ -131,12 +137,14 @@ class ScaleReward(Module):
         self,
         eps = 1e-5,
         discount_factor = 0.999,
-        time_dilate_factor = 1.
+        time_dilate_factor = 1.,
+        mean_center = False
     ):
         super().__init__()
         self.eps = eps
         self.discount_factor = discount_factor
         self.time_dilate_factor = time_dilate_factor
+        self.mean_center = mean_center
 
         self.register_buffer('step', tensor(0))
         self.register_buffer('running_reward', tensor(0.))
@@ -161,12 +169,15 @@ class ScaleReward(Module):
     def forward(
         self,
         reward,
-        is_terminal = False
+        is_terminal = False,
+        update = None
     ):
 
         normed_reward = reward / self.variance.clamp(min = self.eps).sqrt()
 
-        if not self.training:
+        update = default(update, self.training)
+
+        if not update:
             return normed_reward
 
         self.step.add_(1)
@@ -177,8 +188,14 @@ class ScaleReward(Module):
 
         next_reward = running_reward * self.discount_factor * (1. - float(is_terminal)) + reward
 
-        mu_hat = running_reward - running_reward / time
-        next_estimate_p = estimate_p + running_reward * mu_hat
+        mu_hat = next_reward
+
+        # rewards are not mean centered
+
+        if self.mean_center:
+            mu_hat = mu_hat - next_reward / time
+
+        next_estimate_p = estimate_p + next_reward * mu_hat
 
         self.running_reward.copy_(next_reward)
         self.running_estimate_p.copy_(next_estimate_p)
@@ -195,6 +212,7 @@ class StreamingACLambda(Module):
         *,
         actor: Module,
         critic: Module,
+        dim_state,
         dim_actor,
         dim_critic,
         num_discrete_actions = 0,
@@ -205,12 +223,20 @@ class StreamingACLambda(Module):
         critic_kappa = 2.,
         actor_lr = 1e-4,
         critic_lr = 1e-4,
-        value_min = -5.,
-        value_max = 5.,
+        value_min = -3.,
+        value_max = 3.,
         num_critic_bins = 32,
-        entropy_weight = 0.01
+        entropy_weight = 0.01,
+        init_sparsity = 0.9
     ):
         super().__init__()
+
+        # state and reward normalization
+
+        self.state_norm = ObservationNormalizer(dim_state)
+
+        self.reward_norm = ScaleRewardNormalizer()
+        self.register_buffer('discounted_return', tensor(0.))
 
         # actor
 
@@ -291,13 +317,15 @@ class StreamingACLambda(Module):
 
         # sparse init
 
+        self.init_sparsity = init_sparsity
+
         self.apply(self.init_)
 
     def init_(self, module):
         if not isinstance(module, Linear):
             return
 
-        sparse_init_(module)
+        sparse_init_(module, sparsity = self.init_sparsity)
 
     @torch.no_grad()
     def update(
@@ -306,8 +334,17 @@ class StreamingACLambda(Module):
         action,
         next_state,
         reward,
-        is_terminal = tensor(False)
+        is_terminal = False
     ):
+        reward = cast_tensor(reward)
+        is_terminal = cast_tensor(is_terminal)
+
+        # normalize the rewards
+
+        normed_reward = self.reward_norm(reward, is_terminal = is_terminal, update = True)
+
+        # get value grad and prediction
+
         value_grad, value_pred = self.critic_grad_and_value(self.critic_params, state)
 
         actor_grad = self.actor_grad(self.actor_params, (state, action))
@@ -316,7 +353,7 @@ class StreamingACLambda(Module):
 
         assert isinstance(reward, (int, float)) or reward.numel() == 1
 
-        td_error = reward + next_value_pred * self.discount_factor * (~is_terminal).float() - value_pred
+        td_error = normed_reward + next_value_pred * self.discount_factor * (~is_terminal).float() - value_pred
 
         # update actor eligibility trace
 
@@ -337,30 +374,35 @@ class StreamingACLambda(Module):
 
         td_error_factor = td_error.abs().clamp(min = 1.) # if td is small, should not influence
 
-        scale_actor = 1. / (self.actor_kappa * td_error_factor * actor_trace_l1norm).clamp(min = 1.)
-        scale_critic = 1. / (self.critic_kappa * td_error_factor * critic_trace_l1norm).clamp(min = 1.)
+        scale_actor = (self.actor_lr * self.actor_kappa * td_error_factor * actor_trace_l1norm).reciprocal().clamp(max = 1.)
+        scale_critic = (self.critic_lr * self.critic_kappa * td_error_factor * critic_trace_l1norm).reciprocal().clamp(max = 1.)
 
         # update actor params
 
         for name, param in self.actor_params.items():
-
             actor_trace = self.actor_trace[name]
-            update = td_error * self.actor_lr * actor_trace * scale_actor
+            update = td_error  * actor_trace * scale_actor
             param.add_(update)
 
         # update critic params
 
         for name, param in self.critic_params.items():
             critic_trace = self.critic_trace[name]
-            update = td_error * self.critic_lr * critic_trace * scale_critic
+            update = td_error * critic_trace * scale_critic
             param.add_(update)
+
+        # finally update state norm statistics, with state
+
+        self.state_norm(state, update = True)
 
     @torch.no_grad()
     def forward_value(self, state):
+        state = self.state_norm(state, update = False)
         return self.critic_forward(self.critic_params, state)
 
     @torch.no_grad()
     def forward_action(self, state):
+        state = self.state_norm(state, update = False)
         return self.actor_forward(self.actor_params, state)
 
     @torch.no_grad()

@@ -22,6 +22,7 @@ def test_streaming():
         actor = actor,
         critic = critic,
         num_continuous_actions = 1,
+        dim_state = 5,
         dim_actor = 128,
         dim_critic = 128
     )
