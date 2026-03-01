@@ -185,14 +185,14 @@ def main(
     actor = MLP(
         dim_state, dim_actor, dim_actor, dim_actor,
         norm_elementwise_affine = False,
-        activation = nn.LeakyReLU(),
+        activation = nn.SiLU(),
         activate_last = True
     ).to(device)
 
     critic = MLP(
         dim_state, dim_critic, dim_critic, dim_critic,
         norm_elementwise_affine = False,
-        activation = nn.LeakyReLU(),
+        activation = nn.SiLU(),
         activate_last = True
     ).to(device)
 
@@ -265,15 +265,16 @@ def main(
                 )
                 
                 dashboard.update_diagnostics(
-                    td_error = f"{metrics['td_error']:.4f}",
-                    value_pred = f"{metrics['value_pred']:.4f}",
-                    actor_grad = f"{metrics['actor_grad_norm']:.4e}",
-                    actor_norm = f"{metrics['actor_trace_norm']:.4f}",
-                    actor_scale = f"{metrics['actor_scale']:.4e}",
-                    critic_grad = f"{metrics['critic_grad_norm']:.4e}",
-                    critic_norm = f"{metrics['critic_trace_norm']:.4f}",
-                    critic_scale = f"{metrics['critic_scale']:.4e}",
+                    td_error = f"{metrics.td_error:.4f}",
+                    value_pred = f"{metrics.value_pred:.4f}",
+                    actor_grad = f"{metrics.actor_grad_norm:.4e}",
+                    actor_norm = f"{metrics.actor_trace_norm:.4f}",
+                    actor_scale = f"{metrics.actor_scale:.4e}",
+                    critic_grad = f"{metrics.critic_grad_norm:.4e}",
+                    critic_norm = f"{metrics.critic_trace_norm:.4f}",
+                    critic_scale = f"{metrics.critic_scale:.4e}",
                     last_eps_reward = f"{eps_reward:.2f}",
+
                     last_eps_steps = eps_steps
                 )
 

@@ -1,18 +1,20 @@
 from __future__ import annotations
-from typing import Callable
+import math
+from typing import Callable, NamedTuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn, tensor, is_tensor, atan2, sqrt
+from torch import nn, tensor, is_tensor
 from torch.nn import Module, Linear, Sequential
 
-from einops import einsum, rearrange, repeat, reduce, pack, unpack
+from einops import reduce
 
 from discrete_continuous_embed_readout import Readout
 
 from torch_einops_utils import tree_map_tensor
 
 from ema_pytorch import EMA
+
 from hl_gauss_pytorch import HLGaussLayer
 
 from streaming_deep_rl.buffer_dict import BufferDict
@@ -31,8 +33,21 @@ def cast_tensor(t):
 def to_device(tree, device):
     return tree_map_tensor(lambda t: t.to(device), tree)
 
+# return types
+
+class UpdateMetrics(NamedTuple):
+    td_error: float
+    value_pred: float
+    actor_grad_norm: float
+    critic_grad_norm: float
+    actor_trace_norm: float
+    critic_trace_norm: float
+    actor_scale: float
+    critic_scale: float
+
 # initialization
 
+@torch.no_grad()
 def sparse_init_(
     l: Linear,
     sparsity = 0.9
@@ -41,20 +56,25 @@ def sparse_init_(
     Algorithm 1
     """
     weight, bias = l.weight, l.bias
-    _, fan_in = weight.shape
+    device = weight.device
+
+    fan_out, fan_in = weight.shape
 
     value = fan_in ** -0.5
     nn.init.uniform_(weight, -value, value)
 
     assert 0. <= sparsity <= 1.
 
-    n = int(weight.numel() * sparsity)
-    flat_weight = weight.view(-1)
-    sparse_indices = torch.randperm(flat_weight.numel())[:n]
-    nn.init.zeros_(flat_weight[sparse_indices])
+    num_zeros = int(math.ceil(sparsity * fan_in))
+
+    random_scores = torch.randn(fan_out, fan_in, device = device)
+    zero_indices = random_scores.argsort(dim = -1)[:, :num_zeros]
+
+    weight.scatter_(1, zero_indices, 0.)
 
     if exists(bias):
         nn.init.zeros_(bias)
+
 
 # online normalization from Welford in 1962
 
@@ -237,6 +257,15 @@ class StreamingACLambda(Module):
         sigma = 1.
     ):
         super().__init__()
+
+        # quick validate
+
+        with torch.no_grad():
+            mock_state = torch.randn(dim_state)
+            actor_embed = actor(mock_state)
+            critic_embed = critic(mock_state)
+            assert actor_embed.shape[-1] == dim_actor
+            assert critic_embed.shape[-1] == dim_critic
 
         # hl-gauss
 
@@ -436,27 +465,19 @@ class StreamingACLambda(Module):
             else:
                 adapted_traces = traces
 
-            trace_norms = []
-            scales = []
+            # calculate the global trace sum for the ObGD bound
+
+            trace_sum = 0.0
+            for name, trace in adapted_traces.items():
+                trace_sum += trace.abs().sum()
+
+            global_scale = (kappa * td_error_factor * trace_sum).reciprocal().clamp(max = 1.)
 
             for name, param in params.named_parameters():
-                trace = adapted_traces[name]
-                
-                # per-parameter effective step size and scaling
-                param_trace_norm = trace.norm(p=1)
-                
-                param_scale = (kappa * td_error_factor * param_trace_norm).reciprocal().clamp(max=1.)
-                param_update = td_error * trace * param_scale * lr
-                
-                param.data.add_(param_update)
-                
-                trace_norms.append(param_trace_norm)
-                scales.append(param_scale)
+                update = td_error * adapted_traces[name] * global_scale * lr
+                param.data.add_(update)
 
-            mean_trace_norm = torch.stack(trace_norms).mean()
-            mean_scale = torch.stack(scales).mean()
-            return mean_trace_norm, mean_scale
-
+            return trace_sum, global_scale
 
         actor_trace_norm, actor_scale = update_params(
             self.actor_with_readout,
@@ -479,7 +500,7 @@ class StreamingACLambda(Module):
 
         self.critic_ema.update()
 
-        return dict(
+        return UpdateMetrics(
             td_error = td_error.item(),
             value_pred = value_pred.item(),
             actor_grad_norm = actor_grad_norm.item(),
