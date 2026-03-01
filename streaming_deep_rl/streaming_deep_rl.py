@@ -515,20 +515,35 @@ class StreamingACLambda(Module):
     def forward_value(self, state):
         return self.critic_full(state)
 
-    @torch.no_grad()
-    def forward_action(self, state, use_ema = True):
-        state = self.state_norm(state, update = False)
-
-        actor = self.actor_with_readout_ema if use_ema and self.actor_use_ema else self.actor_with_readout
-
-        return actor(state)
-
     def sample_action(self, action_dist):
         return self.readout.sample(action_dist)
 
     @torch.no_grad()
-    def forward(self, state):
-        return self.forward_action(state)
+    def forward_action(
+        self,
+        state,
+        use_ema = True,
+        sample = False
+    ):
+        state = self.state_norm(state, update = False)
+
+        actor = self.actor_with_readout_ema if use_ema and self.actor_use_ema else self.actor_with_readout
+
+        action_dist = actor(state)
+
+        if not sample:
+            return action_dist
+
+        action = self.sample_action(action_dist)
+        return action, action_dist
+
+    @torch.no_grad()
+    def forward(
+        self,
+        state,
+        sample = False
+    ):
+        return self.forward_action(state, sample = sample)
 
 # streaming Q variant
 

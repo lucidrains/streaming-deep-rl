@@ -49,16 +49,12 @@ agent = StreamingACLambda(
     num_discrete_actions = 4
 )
 
-# get action distr
+# get action from state and pass to environment or world model
 
 state = torch.randn(8)
-action_dist = agent(state)
+action, action_dist = agent(state, sample = True)
 
-# sample action
-
-action = agent.sample_action(action_dist)
-
-# environment gives back
+# environment or world model gives back
 
 next_state = torch.randn(8)
 reward = torch.tensor(1.)
