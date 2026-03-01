@@ -424,7 +424,9 @@ class StreamingACLambda(Module):
         action,
         next_state,
         reward,
-        is_terminal = False
+        is_terminal = False,
+        delay_steps = None,
+        drain = False
     ):
         reward = cast_tensor(reward)
         is_terminal = cast_tensor(is_terminal)
@@ -442,7 +444,9 @@ class StreamingACLambda(Module):
 
         # process all pending transitions in the buffer
 
-        should_learn = len(self.delay_buffer) == self.delay_steps or is_terminal.item()
+        delay_steps = default(delay_steps, self.delay_steps)
+
+        should_learn = len(self.delay_buffer) >= delay_steps or is_terminal.item() or drain
 
         if not should_learn:
             return UpdateMetrics(0., 0., 0., 0., 0., 0., 0., 0.)
@@ -455,7 +459,7 @@ class StreamingACLambda(Module):
             metrics = self._learn_step(list(self.delay_buffer))
             self.delay_buffer.popleft()
 
-            if not is_terminal.item():
+            if not is_terminal.item() and not drain:
                 break
 
         return metrics

@@ -43,7 +43,7 @@ from rich.progress import (
 from accelerate import Accelerator
 
 from streaming_deep_rl.streaming_deep_rl import StreamingACLambda
-from x_mlps_pytorch.normed_mlp import MLP
+from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
 
 # constants
 
@@ -187,18 +187,18 @@ def main(
 
     # agent
 
-    actor = MLP(
-        dim_state, dim_actor, dim_actor, dim_actor,
-        norm_elementwise_affine = False,
-        activation = nn.SiLU(),
-        activate_last = True
+    actor = ResidualNormedMLP(
+        dim_actor,
+        dim_in = dim_state,
+        depth = 4,
+        residual_every = 1
     ).to(device)
 
-    critic = MLP(
-        dim_state, dim_critic, dim_critic, dim_critic,
-        norm_elementwise_affine = False,
-        activation = nn.SiLU(),
-        activate_last = True
+    critic = ResidualNormedMLP(
+        dim_critic,
+        dim_in = dim_state,
+        depth = 4,
+        residual_every = 1
     ).to(device)
 
     agent = StreamingACLambda(
@@ -238,7 +238,7 @@ def main(
         regen_reg_rate = regen_reg_rate,
         regen_reg_every = regen_reg_every,
         delay_steps = delay_steps,
-        init_sparsity = init_sparsity,
+        init_sparsity = init_sparsity
     ))
 
     # training loop
