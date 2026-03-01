@@ -72,6 +72,12 @@ agent.update(
 )
 ```
 
+## Lunar Lander
+
+```bash
+$ uv run train_lunar.py
+```
+
 ## Citations
 
 ```bibtex
