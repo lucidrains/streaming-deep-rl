@@ -46,7 +46,8 @@ agent = StreamingACLambda(
     critic = critic,
     dim_state = 8,
     dim_actor = 128,
-    num_discrete_actions = 4
+    num_discrete_actions = 4,
+    delay_steps = 7 # 7-step TD works well for me. next step TD tends to hit a performance wall
 )
 
 # get action from state and pass to environment or world model
