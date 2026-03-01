@@ -132,7 +132,7 @@ def main(
     num_bins = 127,
     regen_reg_rate = 2e-6,
     regen_reg_every = 4,
-    delay_steps = 2,
+    delay_steps = 7,
     init_sparsity = 0.9,
     dim_actor = 128,
     dim_critic = 128
