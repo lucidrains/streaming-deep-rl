@@ -290,13 +290,20 @@ class StreamingACLambda(Module):
         num_bins = 64,
         regen_reg_rate = 0.,
         regen_reg_every = 1,
-        delay_steps = 1
+        delay_steps = 1,
+        enable_pilar = False,
+        pilar_mixing_param = 0.5
     ):
         super().__init__()
         assert delay_steps > 0, 'delay steps must be greater than 0'
 
+        # delay buffer and pilar
+
         self.delay_steps = delay_steps
         self.delay_buffer = deque()
+
+        self.enable_pilar = enable_pilar
+        self.pilar_mixing_param = pilar_mixing_param
 
         # quick validate
 
@@ -467,21 +474,21 @@ class StreamingACLambda(Module):
     def _learn_step(self, buffer_slice):
         """single learning step for the oldest transition in buffer_slice, using n-step return"""
 
-        oldest_state, oldest_action, _, _, _ = buffer_slice[0]
-        _, _, _, last_next_state, last_is_term = buffer_slice[-1]
+        oldest_state, oldest_action, oldest_reward, oldest_next_state, oldest_is_term = buffer_slice[0]
 
         # n-step discounted return
 
         n_step_return = 0.
         discount = 1.0
-        hit_terminal = False
 
         for _, _, reward, _, is_term in buffer_slice:
             n_step_return = n_step_return + discount * reward
-            discount *= self.discount_factor
+
             if is_term.item():
-                hit_terminal = True
+                discount = 0.
                 break
+
+            discount *= self.discount_factor
 
         # all gradient related
 
@@ -492,12 +499,25 @@ class StreamingACLambda(Module):
             embed = self.critic(oldest_state)
             value_pred = self.hl_gauss_layer(embed)
 
-            if not hit_terminal:
+            # n-step td target
+
+            if discount > 0.:
+                last_next_state = buffer_slice[-1][3]
                 next_value_pred = self.critic_ema(last_next_state)
                 td_target = (n_step_return + discount * next_value_pred).detach()
             else:
-                next_value_pred = torch.zeros_like(value_pred)
                 td_target = n_step_return.detach()
+
+            # pilar - average of 1-step and n-step td targets
+            # https://arxiv.org/abs/2402.03903
+
+            if self.enable_pilar and len(buffer_slice) > 1:
+                if oldest_is_term.item():
+                    td_target_1 = oldest_reward.detach()
+                else:
+                    td_target_1 = (oldest_reward + self.discount_factor * self.critic_ema(oldest_next_state)).detach()
+
+                td_target = torch.lerp(td_target_1, td_target, self.pilar_mixing_param)
 
             value_loss = self.hl_gauss_layer(embed, td_target)
 

@@ -99,3 +99,15 @@ $ uv run train_lunar.py
     url     = {https://api.semanticscholar.org/CorpusID:270063045}
 }
 ```
+
+```bibtex
+@misc{daley2025averagingnstepreturnsreduces,
+    title   = {Averaging $n$-step Returns Reduces Variance in Reinforcement Learning}, 
+    author  = {Brett Daley and Martha White and Marlos C. Machado},
+    year    = {2025},
+    eprint  = {2402.03903},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2402.03903}, 
+}
+```

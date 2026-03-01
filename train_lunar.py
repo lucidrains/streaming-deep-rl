@@ -135,7 +135,9 @@ def main(
     delay_steps = 7,
     init_sparsity = 0.9,
     dim_actor = 128,
-    dim_critic = 128
+    dim_critic = 128,
+    enable_pilar = False,
+    pilar_mixing_param = 0.5
 ):
     if render:
         rmtree(VIDEO_FOLDER, ignore_errors = True)
@@ -220,7 +222,9 @@ def main(
         init_sparsity = init_sparsity,
         regen_reg_rate = regen_reg_rate,
         regen_reg_every = regen_reg_every,
-        delay_steps = delay_steps
+        delay_steps = delay_steps,
+        enable_pilar = enable_pilar,
+        pilar_mixing_param = pilar_mixing_param
     )
 
     # metrics
@@ -238,7 +242,9 @@ def main(
         regen_reg_rate = regen_reg_rate,
         regen_reg_every = regen_reg_every,
         delay_steps = delay_steps,
-        init_sparsity = init_sparsity
+        init_sparsity = init_sparsity,
+        enable_pilar = enable_pilar,
+        pilar_mixing_param = pilar_mixing_param
     ))
 
     # training loop
