@@ -13,6 +13,7 @@ from discrete_continuous_embed_readout import Readout
 from torch_einops_utils import tree_map_tensor
 
 from ema_pytorch import EMA
+from hl_gauss_pytorch import HLGaussLayer
 
 from streaming_deep_rl.buffer_dict import BufferDict
 
@@ -47,9 +48,10 @@ def sparse_init_(
 
     assert 0. <= sparsity <= 1.
 
-    n = int(fan_in * sparsity)
-    sparse_indices = torch.randperm(fan_in)[:n]
-    nn.init.zeros_(weight[:, sparse_indices])
+    n = int(weight.numel() * sparsity)
+    flat_weight = weight.view(-1)
+    sparse_indices = torch.randperm(flat_weight.numel())[:n]
+    nn.init.zeros_(flat_weight[sparse_indices])
 
     if exists(bias):
         nn.init.zeros_(bias)
@@ -223,20 +225,36 @@ class StreamingACLambda(Module):
         adaptive = False,
         rms_beta = 0.99,
         eps = 1e-5,
-        actor_use_ema = True,
-        actor_ema_beta = 0.95,
-        critic_ema_beta = 0.95,
+        actor_use_ema = False,
+        actor_ema_beta = 0.7,
+        critic_ema_beta = 0.7,
         entropy_weight = 0.01,
-        init_sparsity = 0.9
+        init_sparsity = 0.9,
+        dim_critic = 128,
+        val_min = -3.,
+        val_max = 3.,
+        num_bins = 64,
+        sigma = 1.
     ):
         super().__init__()
+
+        # hl-gauss
+
+        self.hl_gauss_layer = HLGaussLayer(
+            dim = dim_critic,
+            hl_gauss_loss = dict(
+                min_value = val_min,
+                max_value = val_max,
+                num_bins = num_bins,
+                sigma = sigma
+            )
+        )
 
         # state and reward normalization
 
         self.state_norm = ObservationNormalizer(dim_state)
 
         self.reward_norm = ScaleRewardNormalizer()
-        self.register_buffer('discounted_return', tensor(0.))
 
         # actor
 
@@ -259,7 +277,9 @@ class StreamingACLambda(Module):
 
         self.critic = critic
 
-        self.critic_ema = EMA(critic, beta = critic_ema_beta)
+        self.critic_full = Sequential(critic, self.hl_gauss_layer)
+
+        self.critic_ema = EMA(self.critic_full, beta = critic_ema_beta)
 
         # td related
 
@@ -272,7 +292,7 @@ class StreamingACLambda(Module):
         # eligibility traces
 
         self.actor_trace = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
-        self.critic_trace = BufferDict({name: torch.zeros_like(param) for name, param in self.critic.named_parameters()})
+        self.critic_trace = BufferDict({name: torch.zeros_like(param) for name, param in self.critic_full.named_parameters()})
 
         self.adaptive = adaptive
         self.rms_beta = rms_beta
@@ -280,7 +300,7 @@ class StreamingACLambda(Module):
 
         if adaptive:
             self.actor_v = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
-            self.critic_v = BufferDict({name: torch.zeros_like(param) for name, param in self.critic.named_parameters()})
+            self.critic_v = BufferDict({name: torch.zeros_like(param) for name, param in self.critic_full.named_parameters()})
 
         self.eligibility_trace_decay = eligibility_trace_decay # lambda in paper
 
@@ -340,20 +360,38 @@ class StreamingACLambda(Module):
 
         # all gradient related
 
+        # all gradient related
+
         with torch.enable_grad():
-            # critic pred and grad
+            # critic pred and value loss (reformatted as categorical HL-Gauss)
 
-            value_pred = self.critic(state).mean()
+            embed = self.critic(state)
+            value_pred = self.hl_gauss_layer(embed)
 
-            critic_params = list(self.critic.parameters())
-            critic_grads = torch.autograd.grad(value_pred, critic_params)
-            value_grad = {name: grad for (name, _), grad in zip(self.critic.named_parameters(), critic_grads)}
+            next_value_pred = self.critic_ema(next_state)
+            td_target = (normed_reward + next_value_pred * self.discount_factor * (~is_terminal).float()).detach()
+            
+            value_loss = self.hl_gauss_layer(embed, td_target)
+
+            critic_params = list(self.critic_full.parameters())
+            critic_loss_grads = torch.autograd.grad(value_loss, critic_params)
+
+            td_error = td_target - value_pred
+            td_error_sign = td_error.detach().sign()
+
+            # The ObGD optimizer requires a trace of `nabla_w v(s)`. 
+            # We construct a pseudo-gradient such that when ObGD multiplies by delta,
+            # it recovers exact `-grad(value_loss)` for the current step.
+            # note: Gemini Pro 3.1 thought of this pseudo-gradient logic
+
+            safe_delta = torch.where(td_error.detach() >= 0, 1.0, -1.0) * td_error.detach().abs().clamp(min=1e-6)
+
+            value_grad = {
+                name: -grad / safe_delta
+                for (name, _), grad in zip(self.critic_full.named_parameters(), critic_loss_grads)
+            }
 
             # actor grad with entropy regularization (Appendix E)
-
-            next_value_pred = self.critic_ema(next_state).mean()
-            td_error = normed_reward + next_value_pred * self.discount_factor * (~is_terminal).float() - value_pred
-            td_error_sign = td_error.detach().sign()
 
             action_logits = self.actor_with_readout(state)
             log_prob = self.readout.log_prob(action_logits, action).mean()
@@ -365,7 +403,10 @@ class StreamingACLambda(Module):
             actor_grads = torch.autograd.grad(total_actor_loss, actor_params)
             actor_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), actor_grads)}
 
+        td_error = td_error.detach().squeeze()
+        td_error_sign = td_error_sign.detach().squeeze()
         value_pred = value_pred.detach()
+        next_value_pred = next_value_pred.detach()
 
         # update actor eligibility trace
 
@@ -395,13 +436,27 @@ class StreamingACLambda(Module):
             else:
                 adapted_traces = traces
 
-            trace_norm = torch.stack([trace.norm(p = 1) for trace in adapted_traces.values()]).mean()
-            scale = (kappa * td_error_factor * trace_norm).reciprocal().clamp(max = 1.)
+            trace_norms = []
+            scales = []
 
             for name, param in params.named_parameters():
-                update = td_error * adapted_traces[name] * scale * lr
-                param.data.add_(update)
-            return trace_norm, scale
+                trace = adapted_traces[name]
+                
+                # per-parameter effective step size and scaling
+                param_trace_norm = trace.norm(p=1)
+                
+                param_scale = (kappa * td_error_factor * param_trace_norm).reciprocal().clamp(max=1.)
+                param_update = td_error * trace * param_scale * lr
+                
+                param.data.add_(param_update)
+                
+                trace_norms.append(param_trace_norm)
+                scales.append(param_scale)
+
+            mean_trace_norm = torch.stack(trace_norms).mean()
+            mean_scale = torch.stack(scales).mean()
+            return mean_trace_norm, mean_scale
+
 
         actor_trace_norm, actor_scale = update_params(
             self.actor_with_readout,
@@ -412,7 +467,7 @@ class StreamingACLambda(Module):
         )
 
         critic_trace_norm, critic_scale = update_params(
-            self.critic,
+            self.critic_full,
             self.critic_trace,
             self.critic_v if self.adaptive else None,
             self.critic_kappa,
@@ -428,16 +483,16 @@ class StreamingACLambda(Module):
             td_error = td_error.item(),
             value_pred = value_pred.item(),
             actor_grad_norm = actor_grad_norm.item(),
-            actor_trace_norm = actor_trace_norm.item(),
-            actor_scale = actor_scale.item(),
             critic_grad_norm = critic_grad_norm.item(),
+            actor_trace_norm = actor_trace_norm.item(),
             critic_trace_norm = critic_trace_norm.item(),
+            actor_scale = actor_scale.item(),
             critic_scale = critic_scale.item()
         )
 
     @torch.no_grad()
     def forward_value(self, state):
-        return self.critic(state)
+        return self.critic_full(state)
 
     @torch.no_grad()
     def forward_action(self, state, use_ema = True):

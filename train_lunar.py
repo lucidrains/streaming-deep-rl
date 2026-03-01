@@ -6,7 +6,7 @@
 #   "gymnasium[box2d,other]",
 #   "fire",
 #   "tqdm",
-#   "streaming-deep-rl>=0.0.9",
+#   "x-mlps-pytorch>=0.0.8",
 #   "rich",
 #   "wandb"
 # ]
@@ -72,7 +72,7 @@ class Dashboard:
         self.pbar_task = self.progress.add_task("Episodes", total = num_episodes)
         
         self.episode_info = {
-            "avg_reward_100": 0.0,
+            "avg_cum_reward_100": 0.0,
             "avg_steps_100": 0.0,
             "last_eps_reward": 0.0,
             "last_eps_steps": 0,
@@ -114,19 +114,25 @@ class Dashboard:
 def main(
     num_episodes = 100_000,
     max_timesteps = 1000,
-    actor_lr = 1e-4,
-    critic_lr = 1e-4,
+    actor_lr = 3e-4,
+    critic_lr = 3e-4,
     entropy_weight = 0.01,
     discount_factor = 0.99,
     eligibility_trace_decay = 0.8,
     use_wandb = False,
-    render = False,
+    render = True,
     render_every_eps = 250,
-    clear_videos = False,
     cpu = True,
-    adaptive = False
+    adaptive = True,
+    val_min = -3.,
+    val_max = 3.,
+    num_bins = 51,
+    sigma = 1.,
+    init_sparsity = 0.9,
+    dim_actor = 128,
+    dim_critic = 128
 ):
-    if clear_videos:
+    if render:
         rmtree(VIDEO_FOLDER, ignore_errors = True)
         
     # accelerator
@@ -154,6 +160,11 @@ def main(
 
     env = gym.make(**env_config)
 
+    # env dimensions
+
+    dim_state = int(env.observation_space.shape[0])
+    num_discrete_actions = int(env.action_space.n)
+
     if render:
         console = Console()
         console.print(f"\n[bold green]Video recording enabled.[/bold green]")
@@ -172,31 +183,37 @@ def main(
     # agent
 
     actor = MLP(
-        8, 128, 128, 128,
+        dim_state, dim_actor, dim_actor, dim_actor,
         norm_elementwise_affine = False,
         activation = nn.LeakyReLU(),
         activate_last = True
     ).to(device)
 
     critic = MLP(
-        8, 128, 128, 1,
+        dim_state, dim_critic, dim_critic, dim_critic,
         norm_elementwise_affine = False,
         activation = nn.LeakyReLU(),
-        activate_last = False
+        activate_last = True
     ).to(device)
 
     agent = StreamingACLambda(
         actor = actor,
         critic = critic,
-        dim_state = 8,
-        dim_actor = 128,
-        num_discrete_actions = 4,
+        dim_state = dim_state,
+        dim_actor = dim_actor,
+        num_discrete_actions = num_discrete_actions,
         actor_lr = actor_lr,
         critic_lr = critic_lr,
         entropy_weight = entropy_weight,
         adaptive = adaptive,
         discount_factor = discount_factor,
-        eligibility_trace_decay = eligibility_trace_decay
+        eligibility_trace_decay = eligibility_trace_decay,
+        dim_critic = dim_critic,
+        val_min = val_min,
+        val_max = val_max,
+        num_bins = num_bins,
+        sigma = sigma,
+        init_sparsity = init_sparsity
     )
 
     # metrics
@@ -255,13 +272,17 @@ def main(
                     actor_scale = f"{metrics['actor_scale']:.4e}",
                     critic_grad = f"{metrics['critic_grad_norm']:.4e}",
                     critic_norm = f"{metrics['critic_trace_norm']:.4f}",
-                    critic_scale = f"{metrics['critic_scale']:.4e}"
+                    critic_scale = f"{metrics['critic_scale']:.4e}",
+                    last_eps_reward = f"{eps_reward:.2f}",
+                    last_eps_steps = eps_steps
                 )
-                
+
+                live.update(dashboard.create_renderable())
+
                 state = next_state
                 eps_reward += reward
                 eps_steps += 1
-                
+
                 if terminated or truncated:
                     break
                     
@@ -274,10 +295,8 @@ def main(
             avg_steps = np.mean(rolling_steps)
             
             dashboard.update_episode_info(
-                avg_reward_100 = f"{avg_reward:.2f}",
-                avg_steps_100 = f"{avg_steps:.1f}",
-                last_eps_reward = f"{eps_reward:.2f}",
-                last_eps_steps = eps_steps
+                avg_cum_reward_100 = f"{avg_reward:.2f}",
+                avg_steps_100 = f"{avg_steps:.1f}"
             )
             
             live.update(dashboard.create_renderable())
