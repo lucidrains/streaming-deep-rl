@@ -24,6 +24,9 @@ from streaming_deep_rl.buffer_dict import BufferDict
 def exists(v):
     return v is not None
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def default(v, d):
     return v if exists(v) else d
 
@@ -254,7 +257,8 @@ class StreamingACLambda(Module):
         val_min = -3.,
         val_max = 3.,
         num_bins = 64,
-        sigma = 1.
+        regen_reg_rate = 0.,
+        regen_reg_every = 1
     ):
         super().__init__()
 
@@ -275,7 +279,6 @@ class StreamingACLambda(Module):
                 min_value = val_min,
                 max_value = val_max,
                 num_bins = num_bins,
-                sigma = sigma
             )
         )
 
@@ -348,6 +351,16 @@ class StreamingACLambda(Module):
         self.init_sparsity = init_sparsity
 
         self.apply(self.init_)
+
+        # capture initial parameters for regenerative regularization
+
+        self.regen_reg_rate = regen_reg_rate
+        self.regen_reg_every = regen_reg_every
+
+        self.actor_init_params = BufferDict({name: param.clone().detach() for name, param in self.actor_with_readout.named_parameters()})
+        self.critic_init_params = BufferDict({name: param.clone().detach() for name, param in self.critic_full.named_parameters()})
+
+        self.register_buffer('regen_reg_step', tensor(0))
 
     def init_(self, module):
         if not isinstance(module, Linear):
@@ -494,6 +507,17 @@ class StreamingACLambda(Module):
             self.critic_kappa,
             self.critic_lr
         )
+
+        # regenerative regularization
+
+        self.regen_reg_step.add_(1)
+
+        if self.regen_reg_rate > 0. and divisible_by(self.regen_reg_step.item(), self.regen_reg_every):
+            for name, param in self.actor_with_readout.named_parameters():
+                param.data.lerp_(self.actor_init_params[name], self.regen_reg_rate)
+
+            for name, param in self.critic_full.named_parameters():
+                param.data.lerp_(self.critic_init_params[name], self.regen_reg_rate)
 
         if self.actor_use_ema:
             self.actor_with_readout_ema.update()
