@@ -277,8 +277,10 @@ def main(
                     action = action, 
                     next_state = next_state, 
                     reward = reward_t, 
-                    is_terminal = is_terminal
+                    is_terminal = is_terminal,
+                    drain = terminated or truncated
                 )
+
                 dashboard.update_diagnostics(
                     td_error = f"{metrics.td_error:.4f}",
                     value_pred = f"{metrics.value_pred:.4f}",

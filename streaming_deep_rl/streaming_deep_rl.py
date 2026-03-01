@@ -474,11 +474,13 @@ class StreamingACLambda(Module):
 
         n_step_return = 0.
         discount = 1.0
+        hit_terminal = False
 
         for _, _, reward, _, is_term in buffer_slice:
             n_step_return = n_step_return + discount * reward
             discount *= self.discount_factor
             if is_term.item():
+                hit_terminal = True
                 break
 
         # all gradient related
@@ -490,7 +492,7 @@ class StreamingACLambda(Module):
             embed = self.critic(oldest_state)
             value_pred = self.hl_gauss_layer(embed)
 
-            if not last_is_term.item():
+            if not hit_terminal:
                 next_value_pred = self.critic_ema(last_next_state)
                 td_target = (n_step_return + discount * next_value_pred).detach()
             else:
