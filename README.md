@@ -35,7 +35,7 @@ actor = MLP(
 )
 
 critic = MLP(
-    8, 128, 128, 1,
+    8, 128, 128,
     norm_elementwise_affine = False
 )
 
