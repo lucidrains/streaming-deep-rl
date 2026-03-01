@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+from collections import deque
 from typing import Callable, NamedTuple
 
 import torch
@@ -35,6 +36,36 @@ def cast_tensor(t):
 
 def to_device(tree, device):
     return tree_map_tensor(lambda t: t.to(device), tree)
+
+# regenerative regularization
+
+class RegenerativeRegularization(Module):
+    def __init__(
+        self,
+        networks: list[Module],
+        rate: float,
+        every: int
+    ):
+        super().__init__()
+        self.networks = networks
+        self.rate = rate
+        self.every = every
+        self.register_buffer('step', tensor(0))
+
+        self.init_params = nn.ModuleList([
+            BufferDict({name: param.detach().clone() for name, param in network.named_parameters()})
+            for network in networks
+        ])
+
+    def forward(self):
+        self.step.add_(1)
+
+        if self.rate <= 0. or not divisible_by(self.step.item(), self.every):
+            return
+
+        for network, init_params in zip(self.networks, self.init_params):
+            for name, param in network.named_parameters():
+                param.data.lerp_(init_params[name], self.rate)
 
 # return types
 
@@ -258,9 +289,14 @@ class StreamingACLambda(Module):
         val_max = 3.,
         num_bins = 64,
         regen_reg_rate = 0.,
-        regen_reg_every = 1
+        regen_reg_every = 1,
+        delay_steps = 1
     ):
         super().__init__()
+        assert delay_steps > 0, 'delay steps must be greater than 0'
+
+        self.delay_steps = delay_steps
+        self.delay_buffer = deque()
 
         # quick validate
 
@@ -352,15 +388,15 @@ class StreamingACLambda(Module):
 
         self.apply(self.init_)
 
-        # capture initial parameters for regenerative regularization
+        # regenerative regularization
 
-        self.regen_reg_rate = regen_reg_rate
-        self.regen_reg_every = regen_reg_every
+        self.regen_reg = RegenerativeRegularization(
+            networks = [self.actor_with_readout, self.critic_full],
+            rate = regen_reg_rate,
+            every = regen_reg_every
+        )
 
-        self.actor_init_params = BufferDict({name: param.clone().detach() for name, param in self.actor_with_readout.named_parameters()})
-        self.critic_init_params = BufferDict({name: param.clone().detach() for name, param in self.critic_full.named_parameters()})
-
-        self.register_buffer('regen_reg_step', tensor(0))
+        # set actor and critic lambda if eligibility trace is used
 
     def init_(self, module):
         if not isinstance(module, Linear):
@@ -396,23 +432,67 @@ class StreamingACLambda(Module):
         state = self.state_norm(state, update = True)
         next_state = self.state_norm(next_state, update = False)
 
-        # normalize the rewards
-
         normed_reward = self.reward_norm(reward, is_terminal = is_terminal, update = True)
 
-        # all gradient related
+        self.delay_buffer.append((state, action, normed_reward, next_state, is_terminal))
+
+        # regenerative regularization
+
+        self.regen_reg()
+
+        # process all pending transitions in the buffer
+
+        should_learn = len(self.delay_buffer) == self.delay_steps or is_terminal.item()
+
+        if not should_learn:
+            return UpdateMetrics(0., 0., 0., 0., 0., 0., 0., 0.)
+
+        # process all pending transitions in the buffer
+
+        metrics = None
+
+        while len(self.delay_buffer) > 0:
+            metrics = self._learn_step(list(self.delay_buffer))
+            self.delay_buffer.popleft()
+
+            if not is_terminal.item():
+                break
+
+        return metrics
+
+    def _learn_step(self, buffer_slice):
+        """single learning step for the oldest transition in buffer_slice, using n-step return"""
+
+        oldest_state, oldest_action, _, _, _ = buffer_slice[0]
+        _, _, _, last_next_state, last_is_term = buffer_slice[-1]
+
+        # n-step discounted return
+
+        n_step_return = 0.
+        discount = 1.0
+
+        for _, _, reward, _, is_term in buffer_slice:
+            n_step_return = n_step_return + discount * reward
+            discount *= self.discount_factor
+            if is_term.item():
+                break
 
         # all gradient related
 
         with torch.enable_grad():
-            # critic pred and value loss (reformatted as categorical HL-Gauss)
 
-            embed = self.critic(state)
+            # critic
+
+            embed = self.critic(oldest_state)
             value_pred = self.hl_gauss_layer(embed)
 
-            next_value_pred = self.critic_ema(next_state)
-            td_target = (normed_reward + next_value_pred * self.discount_factor * (~is_terminal).float()).detach()
-            
+            if not last_is_term.item():
+                next_value_pred = self.critic_ema(last_next_state)
+                td_target = (n_step_return + discount * next_value_pred).detach()
+            else:
+                next_value_pred = torch.zeros_like(value_pred)
+                td_target = n_step_return.detach()
+
             value_loss = self.hl_gauss_layer(embed, td_target)
 
             critic_params = list(self.critic_full.parameters())
@@ -421,22 +501,19 @@ class StreamingACLambda(Module):
             td_error = td_target - value_pred
             td_error_sign = td_error.detach().sign()
 
-            # The ObGD optimizer requires a trace of `nabla_w v(s)`. 
-            # We construct a pseudo-gradient such that when ObGD multiplies by delta,
-            # it recovers exact `-grad(value_loss)` for the current step.
-            # note: Gemini Pro 3.1 thought of this pseudo-gradient logic
+            # ObGD pseudo-gradient
 
-            safe_delta = torch.where(td_error.detach() >= 0, 1.0, -1.0) * td_error.detach().abs().clamp(min=1e-6)
+            safe_delta = torch.where(td_error.detach() >= 0, 1.0, -1.0) * td_error.detach().abs().clamp(min = 1e-6)
 
             value_grad = {
                 name: -grad / safe_delta
                 for (name, _), grad in zip(self.critic_full.named_parameters(), critic_loss_grads)
             }
 
-            # actor grad with entropy regularization (Appendix E)
+            # actor with entropy regularization
 
-            action_logits = self.actor_with_readout(state)
-            log_prob = self.readout.log_prob(action_logits, action).mean()
+            action_logits = self.actor_with_readout(oldest_state)
+            log_prob = self.readout.log_prob(action_logits, oldest_action).mean()
             entropy = self.readout.entropy(action_logits).mean()
 
             total_actor_loss = log_prob + self.entropy_weight * td_error_sign * entropy
@@ -448,21 +525,18 @@ class StreamingACLambda(Module):
         td_error = td_error.detach().squeeze()
         td_error_sign = td_error_sign.detach().squeeze()
         value_pred = value_pred.detach()
-        next_value_pred = next_value_pred.detach()
 
-        # update actor eligibility trace
+        # update eligibility traces
 
         decay = self.eligibility_trace_decay * self.discount_factor
 
         for name, trace in self.actor_trace.items():
             trace.mul_(decay).add_(actor_grad[name])
 
-        # update critic eligibility trace
-
         for name, trace in self.critic_trace.items():
             trace.mul_(decay).add_(value_grad[name])
 
-        # overstepping-bounds gradient descent related
+        # overstepping-bounds gradient descent
 
         td_error_factor = td_error.abs().clamp(min = 1.)
 
@@ -477,8 +551,6 @@ class StreamingACLambda(Module):
                 adapted_traces = {name: trace / (vs[name] + self.eps).sqrt() for name, trace in traces.items()}
             else:
                 adapted_traces = traces
-
-            # calculate the global trace sum for the ObGD bound
 
             trace_sum = 0.0
             for name, trace in adapted_traces.items():
@@ -507,17 +579,6 @@ class StreamingACLambda(Module):
             self.critic_kappa,
             self.critic_lr
         )
-
-        # regenerative regularization
-
-        self.regen_reg_step.add_(1)
-
-        if self.regen_reg_rate > 0. and divisible_by(self.regen_reg_step.item(), self.regen_reg_every):
-            for name, param in self.actor_with_readout.named_parameters():
-                param.data.lerp_(self.actor_init_params[name], self.regen_reg_rate)
-
-            for name, param in self.critic_full.named_parameters():
-                param.data.lerp_(self.critic_init_params[name], self.regen_reg_rate)
 
         if self.actor_use_ema:
             self.actor_with_readout_ema.update()

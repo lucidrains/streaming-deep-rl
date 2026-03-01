@@ -60,7 +60,7 @@ def divisible_by(num, den):
 # UI implementation
 
 class Dashboard:
-    def __init__(self, num_episodes):
+    def __init__(self, num_episodes, hyperparams=None):
         self.progress = Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -70,6 +70,8 @@ class Dashboard:
             expand = True
         )
         self.pbar_task = self.progress.add_task("Episodes", total = num_episodes)
+        
+        self.hyperparams = hyperparams or {}
         
         self.episode_info = {
             "avg_cum_reward_100": 0.0,
@@ -95,24 +97,25 @@ class Dashboard:
     def advance_progress(self):
         self.progress.update(self.pbar_task, advance = 1)
 
-    def create_renderable(self):
+    def _make_table(self, data, columns, styles):
         table = Table(box = box.ROUNDED, expand = True)
-        table.add_column("Metric", style = "cyan", width = 30)
-        table.add_column("Value", style = "magenta", width = 20)
-        
-        for k, v in self.episode_info.items():
+        for col, style in zip(columns, styles):
+            table.add_column(col, style = style, width = 30)
+        for k, v in data.items():
             table.add_row(k, str(v))
-            
-        group = Group(
-            Panel(self.progress, title = "Progress", border_style = "green"),
-            Panel(table, title = "[b]Streaming RL Training[/b]", border_style = "blue")
-        )
-        return group
+        return table
+
+    def create_renderable(self):
+        progress_panel = Panel(self.progress, title = "Progress", border_style = "green")
+        metrics_panel = Panel(self._make_table(self.episode_info, ("Metric", "Value"), ("cyan", "magenta")), title = "[b]Streaming RL Training[/b]", border_style = "blue")
+        config_panel = Panel(self._make_table(self.hyperparams, ("Hyperparameter", "Value"), ("yellow", "white")), title = "[b]Configuration[/b]", border_style = "yellow")
+
+        return Group(progress_panel, metrics_panel, config_panel)
 
 # main
 
 def main(
-    num_episodes = 10_000,
+    num_episodes = 20_000,
     max_timesteps = 1000,
     actor_lr = 3e-4,
     critic_lr = 3e-4,
@@ -129,6 +132,7 @@ def main(
     num_bins = 127,
     regen_reg_rate = 2e-6,
     regen_reg_every = 4,
+    delay_steps = 2,
     init_sparsity = 0.9,
     dim_actor = 128,
     dim_critic = 128
@@ -215,7 +219,8 @@ def main(
         num_bins = num_bins,
         init_sparsity = init_sparsity,
         regen_reg_rate = regen_reg_rate,
-        regen_reg_every = regen_reg_every
+        regen_reg_every = regen_reg_every,
+        delay_steps = delay_steps
     )
 
     # metrics
@@ -223,9 +228,18 @@ def main(
     rolling_reward = deque(maxlen = 100)
     rolling_steps = deque(maxlen = 100)
 
-    # dashboard
-
-    dashboard = Dashboard(num_episodes)
+    dashboard = Dashboard(num_episodes, hyperparams = dict(
+        actor_lr = actor_lr,
+        critic_lr = critic_lr,
+        entropy_weight = entropy_weight,
+        discount_factor = discount_factor,
+        eligibility_trace_decay = eligibility_trace_decay,
+        adaptive = adaptive,
+        regen_reg_rate = regen_reg_rate,
+        regen_reg_every = regen_reg_every,
+        delay_steps = delay_steps,
+        init_sparsity = init_sparsity,
+    ))
 
     # training loop
 
