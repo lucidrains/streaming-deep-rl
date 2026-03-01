@@ -44,6 +44,7 @@ from accelerate import Accelerator
 
 from streaming_deep_rl.streaming_deep_rl import StreamingACLambda
 from x_mlps_pytorch.normed_mlp import MLP
+from x_mlps_pytorch.nff import nFeedforwards
 
 # constants
 
@@ -112,7 +113,7 @@ class Dashboard:
 # main
 
 def main(
-    num_episodes = 100_000,
+    num_episodes = 10_000,
     max_timesteps = 1000,
     actor_lr = 3e-4,
     critic_lr = 3e-4,
@@ -124,10 +125,11 @@ def main(
     render_every_eps = 250,
     cpu = True,
     adaptive = True,
-    val_min = -3.,
-    val_max = 3.,
-    num_bins = 51,
-    sigma = 1.,
+    val_min = -2.5,
+    val_max = 2.5,
+    num_bins = 127,
+    sigma = 0.5,
+    use_nff = False,
     init_sparsity = 0.9,
     dim_actor = 128,
     dim_critic = 128
@@ -182,19 +184,33 @@ def main(
 
     # agent
 
-    actor = MLP(
-        dim_state, dim_actor, dim_actor, dim_actor,
-        norm_elementwise_affine = False,
-        activation = nn.SiLU(),
-        activate_last = True
-    ).to(device)
+    if use_nff:
+        actor = nFeedforwards(
+            dim = dim_actor,
+            depth = 2,
+            dim_in = dim_state,
+        ).to(device)
 
-    critic = MLP(
-        dim_state, dim_critic, dim_critic, dim_critic,
-        norm_elementwise_affine = False,
-        activation = nn.SiLU(),
-        activate_last = True
-    ).to(device)
+        critic = nFeedforwards(
+            dim = dim_critic,
+            depth = 2,
+            dim_in = dim_state,
+            dim_out = dim_critic
+        ).to(device)
+    else:
+        actor = MLP(
+            dim_state, dim_actor, dim_actor, dim_actor,
+            norm_elementwise_affine = False,
+            activation = nn.SiLU(),
+            activate_last = True
+        ).to(device)
+
+        critic = MLP(
+            dim_state, dim_critic, dim_critic, dim_critic,
+            norm_elementwise_affine = False,
+            activation = nn.SiLU(),
+            activate_last = True
+        ).to(device)
 
     agent = StreamingACLambda(
         actor = actor,
@@ -263,7 +279,11 @@ def main(
                     reward = reward_t, 
                     is_terminal = is_terminal
                 )
-                
+
+                if use_nff:
+                    actor.norm_weights_()
+                    critic.norm_weights_()
+
                 dashboard.update_diagnostics(
                     td_error = f"{metrics.td_error:.4f}",
                     value_pred = f"{metrics.value_pred:.4f}",
