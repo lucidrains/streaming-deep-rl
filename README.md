@@ -4,7 +4,7 @@
 
 Explorations into the proposed [Streaming Deep Reinforcement Learning](https://arxiv.org/abs/2410.14606), from University of Alberta.
 
-Once completed, if it checks out, will reach to integrate the Stream Q(λ) with [Q-Transformer](https://github.com/lucidrains/q-transformer).
+Once completed, if it checks out, will reach to integrate the Stream Q(λ) with [Q-Transformer](https://codeberg.org/lucidrains/q-transformer).
 
 A recent testimony to Streaming AC(λ) variant can be found [here](https://blog.9600baud.net/streaming-deep-rl-honeypot.html). Will be incorporated into the repository as well with a few improvements.
 
