@@ -117,8 +117,8 @@ class Dashboard:
 def main(
     num_episodes = 20_000,
     max_timesteps = 1000,
-    actor_lr = 3e-4,
-    critic_lr = 3e-4,
+    actor_lr = 1.0,
+    critic_lr = 1.0,
     entropy_weight = 0.01,
     discount_factor = 0.99,
     eligibility_trace_decay = 0.8,
