@@ -276,8 +276,9 @@ class StreamingACLambda(Module):
         critic_kappa = 2.,
         actor_lr = 1e-4,
         critic_lr = 1e-4,
-        adaptive = False,
-        rms_beta = 0.99,
+        adaptive = True,
+        adam_beta1 = 0.9,
+        adam_beta2 = 0.999,
         eps = 1e-5,
         actor_use_ema = False,
         actor_ema_beta = 0.7,
@@ -370,10 +371,15 @@ class StreamingACLambda(Module):
         self.critic_trace = BufferDict({name: torch.zeros_like(param) for name, param in self.critic_full.named_parameters()})
 
         self.adaptive = adaptive
-        self.rms_beta = rms_beta
+        self.adam_beta1 = adam_beta1
+        self.adam_beta2 = adam_beta2
         self.eps = eps
 
         if adaptive:
+            self.register_buffer('step', tensor(0))
+            self.actor_m = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
+            self.critic_m = BufferDict({name: torch.zeros_like(param) for name, param in self.critic_full.named_parameters()})
+
             self.actor_v = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
             self.critic_v = BufferDict({name: torch.zeros_like(param) for name, param in self.critic_full.named_parameters()})
 
@@ -419,6 +425,14 @@ class StreamingACLambda(Module):
             trace.zero_()
 
         if self.adaptive:
+            self.step.zero_()
+
+            for m in self.actor_m.values():
+                m.zero_()
+
+            for m in self.critic_m.values():
+                m.zero_()
+
             for v in self.actor_v.values():
                 v.zero_()
 
@@ -569,23 +583,47 @@ class StreamingACLambda(Module):
         actor_grad_norm = torch.stack([g.norm(p=1) for g in actor_grad.values()]).mean()
         critic_grad_norm = torch.stack([g.norm(p=1) for g in value_grad.values()]).mean()
 
-        def update_params(params, traces, vs, kappa, lr):
+        if self.adaptive:
+            self.step.add_(1)
+            step = self.step.item()
+            bias_correction1 = 1. - self.adam_beta1 ** step
+            bias_correction2 = 1. - self.adam_beta2 ** step
+
+        def update_params(params, traces, ms, vs, kappa, lr):
             if self.adaptive:
-                for name, v in vs.items():
-                    v.mul_(self.rms_beta).add_((td_error * traces[name]) ** 2, alpha = 1 - self.rms_beta)
+                # update first and second moments of semi-gradients
 
-                adapted_traces = {name: trace / (vs[name] + self.eps).sqrt() for name, trace in traces.items()}
+                for name, trace in traces.items():
+                    m, v = ms[name], vs[name]
+                    grad = td_error * trace
+
+                    m.lerp_(grad, 1. - self.adam_beta1)
+                    v.mul_(self.adam_beta2).add_(grad ** 2, alpha = 1. - self.adam_beta2)
+
+                # adam update direction + obgd bound (Algorithm 11)
+
+                adapted_grads = {}
+                trace_sum = 0.0
+
+                for name, trace in traces.items():
+                    v_hat = vs[name] / bias_correction2
+                    denom = v_hat.sqrt() + self.eps
+
+                    m_hat = ms[name] / bias_correction1
+                    adapted_grads[name] = m_hat / denom
+
+                    trace_sum += (trace / denom).abs().sum()
             else:
-                adapted_traces = traces
+                adapted_grads = {name: td_error * trace for name, trace in traces.items()}
 
-            trace_sum = 0.0
-            for name, trace in adapted_traces.items():
-                trace_sum += trace.abs().sum()
+                trace_sum = 0.0
+                for trace in traces.values():
+                    trace_sum += trace.abs().sum()
 
             global_scale = (kappa * td_error_factor * trace_sum).reciprocal().clamp(max = 1.)
 
             for name, param in params.named_parameters():
-                update = td_error * adapted_traces[name] * global_scale * lr
+                update = adapted_grads[name] * global_scale * lr
                 param.data.add_(update)
 
             return trace_sum, global_scale
@@ -593,6 +631,7 @@ class StreamingACLambda(Module):
         actor_trace_norm, actor_scale = update_params(
             self.actor_with_readout,
             self.actor_trace,
+            self.actor_m if self.adaptive else None,
             self.actor_v if self.adaptive else None,
             self.actor_kappa,
             self.actor_lr
@@ -601,6 +640,7 @@ class StreamingACLambda(Module):
         critic_trace_norm, critic_scale = update_params(
             self.critic_full,
             self.critic_trace,
+            self.critic_m if self.adaptive else None,
             self.critic_v if self.adaptive else None,
             self.critic_kappa,
             self.critic_lr
