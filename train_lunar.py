@@ -130,14 +130,15 @@ def main(
     val_min = -2.5,
     val_max = 2.5,
     num_bins = 127,
-    regen_reg_rate = 2e-6,
-    regen_reg_every = 4,
     delay_steps = 7,
     init_sparsity = 0.9,
     dim_actor = 128,
     dim_critic = 128,
     enable_pilar = False,
-    pilar_mixing_param = 0.5
+    pilar_mixing_param = 0.5,
+    weight_decay = 0.,
+    cautious_wd = False,
+    wd_towards_init = False
 ):
     if render:
         rmtree(VIDEO_FOLDER, ignore_errors = True)
@@ -220,11 +221,12 @@ def main(
         val_max = val_max,
         num_bins = num_bins,
         init_sparsity = init_sparsity,
-        regen_reg_rate = regen_reg_rate,
-        regen_reg_every = regen_reg_every,
         delay_steps = delay_steps,
         enable_pilar = enable_pilar,
-        pilar_mixing_param = pilar_mixing_param
+        pilar_mixing_param = pilar_mixing_param,
+        weight_decay = weight_decay,
+        cautious_wd = cautious_wd,
+        wd_towards_init = wd_towards_init
     )
 
     # metrics
@@ -239,12 +241,13 @@ def main(
         discount_factor = discount_factor,
         eligibility_trace_decay = eligibility_trace_decay,
         adaptive = adaptive,
-        regen_reg_rate = regen_reg_rate,
-        regen_reg_every = regen_reg_every,
         delay_steps = delay_steps,
         init_sparsity = init_sparsity,
         enable_pilar = enable_pilar,
-        pilar_mixing_param = pilar_mixing_param
+        pilar_mixing_param = pilar_mixing_param,
+        weight_decay = weight_decay,
+        cautious_wd = cautious_wd,
+        wd_towards_init = wd_towards_init
     ))
 
     # training loop

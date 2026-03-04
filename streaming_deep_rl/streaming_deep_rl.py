@@ -37,35 +37,6 @@ def cast_tensor(t):
 def to_device(tree, device):
     return tree_map_tensor(lambda t: t.to(device), tree)
 
-# regenerative regularization
-
-class RegenerativeRegularization(Module):
-    def __init__(
-        self,
-        networks: list[Module],
-        rate: float,
-        every: int
-    ):
-        super().__init__()
-        self.networks = networks
-        self.rate = rate
-        self.every = every
-        self.register_buffer('step', tensor(0))
-
-        self.init_params = nn.ModuleList([
-            BufferDict({name: param.detach().clone() for name, param in network.named_parameters()})
-            for network in networks
-        ])
-
-    def forward(self):
-        self.step.add_(1)
-
-        if self.rate <= 0. or not divisible_by(self.step.item(), self.every):
-            return
-
-        for network, init_params in zip(self.networks, self.init_params):
-            for name, param in network.named_parameters():
-                param.data.lerp_(init_params[name], self.rate)
 
 # return types
 
@@ -289,8 +260,9 @@ class StreamingACLambda(Module):
         val_min = -3.,
         val_max = 3.,
         num_bins = 64,
-        regen_reg_rate = 0.,
-        regen_reg_every = 1,
+        weight_decay = 0.,
+        cautious_wd = False,
+        wd_towards_init = False,
         delay_steps = 1,
         enable_pilar = False,
         pilar_mixing_param = 0.5
@@ -395,19 +367,22 @@ class StreamingACLambda(Module):
         self.actor_lr = actor_lr
         self.critic_lr = critic_lr
 
+        self.weight_decay = weight_decay
+        self.cautious_wd = cautious_wd
+        self.wd_towards_init = wd_towards_init
+
+        self.init_params = None
+        if weight_decay > 0. and wd_towards_init:
+            self.init_params = nn.ModuleDict({
+                'actor': BufferDict({name: param.detach().clone() for name, param in self.actor_with_readout.named_parameters()}),
+                'critic': BufferDict({name: param.detach().clone() for name, param in self.critic_full.named_parameters()})
+            })
+
         # sparse init
 
         self.init_sparsity = init_sparsity
 
         self.apply(self.init_)
-
-        # regenerative regularization
-
-        self.regen_reg = RegenerativeRegularization(
-            networks = [self.actor_with_readout, self.critic_full],
-            rate = regen_reg_rate,
-            every = regen_reg_every
-        )
 
         # set actor and critic lambda if eligibility trace is used
 
@@ -458,10 +433,6 @@ class StreamingACLambda(Module):
         normed_reward = self.reward_norm(reward, is_terminal = is_terminal, update = True)
 
         self.delay_buffer.append((state, action, normed_reward, next_state, is_terminal))
-
-        # regenerative regularization
-
-        self.regen_reg()
 
         # process all pending transitions in the buffer
 
@@ -589,7 +560,7 @@ class StreamingACLambda(Module):
             bias_correction1 = 1. - self.adam_beta1 ** step
             bias_correction2 = 1. - self.adam_beta2 ** step
 
-        def update_params(params, traces, ms, vs, kappa, lr):
+        def update_params(params, init_params, traces, ms, vs, kappa, lr, wd, cautious_wd, wd_towards_init):
             if self.adaptive:
                 # update first and second moments of semi-gradients
 
@@ -624,26 +595,46 @@ class StreamingACLambda(Module):
 
             for name, param in params.named_parameters():
                 update = adapted_grads[name] * global_scale * lr
+
+                # weight decay
+
+                if wd > 0.:
+                    target = init_params[name] if wd_towards_init else torch.zeros_like(param)
+
+                    wd_mask = 1.
+                    if cautious_wd:
+                        wd_mask = (update * (target - param) > 0).float()
+
+                    param.data.lerp_(target, lr * wd * wd_mask * global_scale)
+
                 param.data.add_(update)
 
             return trace_sum, global_scale
 
         actor_trace_norm, actor_scale = update_params(
             self.actor_with_readout,
+            self.init_params['actor'] if exists(self.init_params) else None,
             self.actor_trace,
             self.actor_m if self.adaptive else None,
             self.actor_v if self.adaptive else None,
             self.actor_kappa,
-            self.actor_lr
+            self.actor_lr,
+            self.weight_decay,
+            self.cautious_wd,
+            self.wd_towards_init
         )
 
         critic_trace_norm, critic_scale = update_params(
             self.critic_full,
+            self.init_params['critic'] if exists(self.init_params) else None,
             self.critic_trace,
             self.critic_m if self.adaptive else None,
             self.critic_v if self.adaptive else None,
             self.critic_kappa,
-            self.critic_lr
+            self.critic_lr,
+            self.weight_decay,
+            self.cautious_wd,
+            self.wd_towards_init
         )
 
         if self.actor_use_ema:

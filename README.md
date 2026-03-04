@@ -111,3 +111,27 @@ $ uv run train_lunar.py
     url     = {https://arxiv.org/abs/2402.03903}, 
 }
 ```
+
+```bibtex
+@misc{chen2026cautiousweightdecay,
+    title   = {Cautious Weight Decay}, 
+    author  = {Lizhang Chen and Jonathan Li and Kaizhao Liang and Baiyu Su and Cong Xie and Nuo Wang Pierse and Chen Liang and Ni Lao and Qiang Liu},
+    year    = {2026},
+    eprint  = {2510.12402},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2510.12402}, 
+}
+```
+
+```bibtex
+@misc{kumar2024maintainingplasticitycontinuallearning,
+    title   = {Maintaining Plasticity in Continual Learning via Regenerative Regularization}, 
+    author  = {Saurabh Kumar and Henrik Marklund and Benjamin Van Roy},
+    year    = {2024},
+    eprint  = {2308.11958},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2308.11958}, 
+}
+```
