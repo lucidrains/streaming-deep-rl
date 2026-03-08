@@ -140,10 +140,7 @@ def main(
     l1_weight_decay = 0.,
     cautious_wd = False,
     wd_towards_init = False,
-    shrink_perturb_every = 0,
-    shrink_factor = 0.05,
-    perturb_amplitude = 1.0,
-    shrink_towards_init = True
+    use_critic_ema = True
 ):
     if render:
         rmtree(VIDEO_FOLDER, ignore_errors = True)
@@ -231,10 +228,7 @@ def main(
         l1_weight_decay = l1_weight_decay,
         cautious_wd = cautious_wd,
         wd_towards_init = wd_towards_init,
-        shrink_perturb_every = shrink_perturb_every,
-        shrink_factor = shrink_factor,
-        perturb_amplitude = perturb_amplitude,
-        shrink_towards_init = shrink_towards_init
+        use_critic_ema = use_critic_ema
     )
 
     # metrics
@@ -257,10 +251,7 @@ def main(
         l1_weight_decay = l1_weight_decay,
         cautious_wd = cautious_wd,
         wd_towards_init = wd_towards_init,
-        shrink_perturb_every = shrink_perturb_every,
-        shrink_factor = shrink_factor,
-        perturb_amplitude = perturb_amplitude,
-        shrink_towards_init = shrink_towards_init
+        use_critic_ema = use_critic_ema
     ))
 
     # training loop

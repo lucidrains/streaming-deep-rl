@@ -267,10 +267,7 @@ class StreamingACLambda(Module):
         delay_steps = 1,
         enable_pilar = False,
         pilar_mixing_param = 0.5,
-        shrink_perturb_every = 0,
-        shrink_factor = 0.05,
-        perturb_amplitude = 1.0,
-        shrink_towards_init = True
+        use_critic_ema = True
     ):
         super().__init__()
         assert delay_steps > 0, 'delay steps must be greater than 0'
@@ -332,7 +329,8 @@ class StreamingACLambda(Module):
 
         self.critic_full = Sequential(critic, self.hl_gauss_layer)
 
-        self.critic_ema = EMA(self.critic_full, beta = critic_ema_beta)
+        self.use_critic_ema = use_critic_ema
+        self.critic_ema = EMA(self.critic_full, beta = critic_ema_beta) if self.use_critic_ema else None
 
         # td related
 
@@ -384,27 +382,18 @@ class StreamingACLambda(Module):
         self.cautious_wd = cautious_wd
         self.wd_towards_init = wd_towards_init
 
-        self.init_params = None
-        if self.has_any_wd and wd_towards_init:
-            self.init_params = nn.ModuleDict({
-                'actor': BufferDict({name: param.detach().clone() for name, param in self.actor_with_readout.named_parameters()}),
-                'critic': BufferDict({name: param.detach().clone() for name, param in self.critic_full.named_parameters()})
-            })
-
         # sparse init
 
         self.init_sparsity = init_sparsity
 
         self.apply(self.init_)
 
-        # shrink and perturb
-
-        self.shrink_perturb_every = shrink_perturb_every
-        self.shrink_factor = shrink_factor
-        self.perturb_amplitude = perturb_amplitude
-        self.shrink_towards_init = shrink_towards_init
-
-        self.register_buffer('update_step', tensor(0))
+        self.init_params = None
+        if self.has_any_wd and wd_towards_init:
+            self.init_params = nn.ModuleDict({
+                'actor': BufferDict({name: param.detach().clone() for name, param in self.actor_with_readout.named_parameters()}),
+                'critic': BufferDict({name: param.detach().clone() for name, param in self.critic_full.named_parameters()})
+            })
 
         # set actor and critic lambda if eligibility trace is used
 
@@ -510,7 +499,7 @@ class StreamingACLambda(Module):
 
             if discount > 0.:
                 last_next_state = buffer_slice[-1][3]
-                next_value_pred = self.critic_ema(last_next_state)
+                next_value_pred = self.critic_ema(last_next_state) if self.use_critic_ema else self.critic_full(last_next_state)
                 td_target = (n_step_return + discount * next_value_pred).detach()
             else:
                 td_target = n_step_return.detach()
@@ -522,7 +511,7 @@ class StreamingACLambda(Module):
                 if oldest_is_term.item():
                     td_target_1 = oldest_reward.detach()
                 else:
-                    td_target_1 = (oldest_reward + self.discount_factor * self.critic_ema(oldest_next_state)).detach()
+                    td_target_1 = (oldest_reward + self.discount_factor * (self.critic_ema(oldest_next_state) if self.use_critic_ema else self.critic_full(oldest_next_state))).detach()
 
                 td_target = torch.lerp(td_target_1, td_target, self.pilar_mixing_param)
 
@@ -621,7 +610,11 @@ class StreamingACLambda(Module):
             for name, param in params.named_parameters():
                 update = adapted_grads[name] * global_scale * lr
 
-                # weight decay
+                # add gradient update first
+
+                param.data.add_(update)
+
+                # weight decay (applied after main update for proper L1 sparsity)
 
                 if has_any_wd:
                     target = init_params[name] if wd_towards_init else torch.zeros_like(param)
@@ -642,8 +635,6 @@ class StreamingACLambda(Module):
                         diff = param.data - target
                         shrunk_diff = diff.sign() * (diff.abs() - l1_amount).relu()
                         param.data.copy_(target + shrunk_diff)
-
-                param.data.add_(update)
 
             return trace_sum, global_scale
 
@@ -684,12 +675,8 @@ class StreamingACLambda(Module):
         if self.actor_use_ema:
             self.actor_with_readout_ema.update()
 
-        self.critic_ema.update()
-
-        self.update_step.add_(1)
-
-        if self.shrink_perturb_every > 0 and divisible_by(self.update_step.item(), self.shrink_perturb_every):
-            self.shrink_and_perturb_()
+        if self.use_critic_ema:
+            self.critic_ema.update()
 
         return UpdateMetrics(
             td_error = td_error.item(),
@@ -701,23 +688,6 @@ class StreamingACLambda(Module):
             actor_scale = actor_scale.item(),
             critic_scale = critic_scale.item()
         )
-
-    @torch.no_grad()
-    def shrink_and_perturb_(self):
-        def process_params(params):
-            for name, param in params.named_parameters():
-                is_weight = param.ndim == 2
-                if is_weight:
-                    mock_linear = nn.Linear(param.shape[1], param.shape[0], bias=False).to(param.device)
-                    sparse_init_(mock_linear, sparsity=self.init_sparsity)
-                    target = mock_linear.weight
-                else:
-                    target = torch.randn_like(param)
-
-                param.data.lerp_(target, self.shrink_factor)
-
-        process_params(self.actor_with_readout)
-        process_params(self.critic_full)
 
     @torch.no_grad()
     def forward_value(self, state):
