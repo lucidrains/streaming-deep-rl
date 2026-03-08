@@ -260,12 +260,17 @@ class StreamingACLambda(Module):
         val_min = -3.,
         val_max = 3.,
         num_bins = 64,
-        weight_decay = 0.,
+        l2_weight_decay = 0.,
+        l1_weight_decay = 0.,
         cautious_wd = False,
         wd_towards_init = False,
         delay_steps = 1,
         enable_pilar = False,
-        pilar_mixing_param = 0.5
+        pilar_mixing_param = 0.5,
+        shrink_perturb_every = 0,
+        shrink_factor = 0.05,
+        perturb_amplitude = 1.0,
+        shrink_towards_init = True
     ):
         super().__init__()
         assert delay_steps > 0, 'delay steps must be greater than 0'
@@ -367,12 +372,20 @@ class StreamingACLambda(Module):
         self.actor_lr = actor_lr
         self.critic_lr = critic_lr
 
-        self.weight_decay = weight_decay
+        self.has_l2_weight_decay = l2_weight_decay > 0.
+        self.has_l1_weight_decay = l1_weight_decay > 0.
+
+        assert not (self.has_l2_weight_decay and self.has_l1_weight_decay), 'l2 and l1 weight decay are mutually exclusive'
+
+        self.has_any_wd = self.has_l2_weight_decay or self.has_l1_weight_decay
+
+        self.l2_weight_decay = l2_weight_decay
+        self.l1_weight_decay = l1_weight_decay
         self.cautious_wd = cautious_wd
         self.wd_towards_init = wd_towards_init
 
         self.init_params = None
-        if weight_decay > 0. and wd_towards_init:
+        if self.has_any_wd and wd_towards_init:
             self.init_params = nn.ModuleDict({
                 'actor': BufferDict({name: param.detach().clone() for name, param in self.actor_with_readout.named_parameters()}),
                 'critic': BufferDict({name: param.detach().clone() for name, param in self.critic_full.named_parameters()})
@@ -383,6 +396,15 @@ class StreamingACLambda(Module):
         self.init_sparsity = init_sparsity
 
         self.apply(self.init_)
+
+        # shrink and perturb
+
+        self.shrink_perturb_every = shrink_perturb_every
+        self.shrink_factor = shrink_factor
+        self.perturb_amplitude = perturb_amplitude
+        self.shrink_towards_init = shrink_towards_init
+
+        self.register_buffer('update_step', tensor(0))
 
         # set actor and critic lambda if eligibility trace is used
 
@@ -527,11 +549,14 @@ class StreamingACLambda(Module):
             log_prob = self.readout.log_prob(action_logits, oldest_action).mean()
             entropy = self.readout.entropy(action_logits).mean()
 
-            total_actor_loss = log_prob + self.entropy_weight * td_error_sign * entropy
+            actor_loss = log_prob + self.entropy_weight * td_error_sign * entropy
 
             actor_params = list(self.actor_with_readout.parameters())
-            actor_grads = torch.autograd.grad(total_actor_loss, actor_params)
-            actor_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), actor_grads)}
+
+            # policy and entropy gradient goes into the eligibility trace
+
+            actor_loss_grads = torch.autograd.grad(actor_loss, actor_params, retain_graph = True)
+            actor_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), actor_loss_grads)}
 
         td_error = td_error.detach().squeeze()
         td_error_sign = td_error_sign.detach().squeeze()
@@ -560,7 +585,7 @@ class StreamingACLambda(Module):
             bias_correction1 = 1. - self.adam_beta1 ** step
             bias_correction2 = 1. - self.adam_beta2 ** step
 
-        def update_params(params, init_params, traces, ms, vs, kappa, lr, wd, cautious_wd, wd_towards_init):
+        def update_params(params, init_params, traces, ms, vs, kappa, lr, l2_wd, has_l2_wd, l1_wd, has_l1_wd, has_any_wd, cautious_wd, wd_towards_init):
             if self.adaptive:
                 # update first and second moments of semi-gradients
 
@@ -598,14 +623,25 @@ class StreamingACLambda(Module):
 
                 # weight decay
 
-                if wd > 0.:
+                if has_any_wd:
                     target = init_params[name] if wd_towards_init else torch.zeros_like(param)
 
                     wd_mask = 1.
                     if cautious_wd:
                         wd_mask = (update * (target - param) > 0).float()
 
-                    param.data.lerp_(target, lr * wd * wd_mask * global_scale)
+                    # l2
+
+                    if has_l2_wd:
+                        param.data.lerp_(target, lr * l2_wd * wd_mask * global_scale)
+
+                    # l1 with soft thresholding
+
+                    if has_l1_wd:
+                        l1_amount = lr * l1_wd * wd_mask * global_scale
+                        diff = param.data - target
+                        shrunk_diff = diff.sign() * (diff.abs() - l1_amount).relu()
+                        param.data.copy_(target + shrunk_diff)
 
                 param.data.add_(update)
 
@@ -619,7 +655,11 @@ class StreamingACLambda(Module):
             self.actor_v if self.adaptive else None,
             self.actor_kappa,
             self.actor_lr,
-            self.weight_decay,
+            self.l2_weight_decay,
+            self.has_l2_weight_decay,
+            self.l1_weight_decay,
+            self.has_l1_weight_decay,
+            self.has_any_wd,
             self.cautious_wd,
             self.wd_towards_init
         )
@@ -632,7 +672,11 @@ class StreamingACLambda(Module):
             self.critic_v if self.adaptive else None,
             self.critic_kappa,
             self.critic_lr,
-            self.weight_decay,
+            self.l2_weight_decay,
+            self.has_l2_weight_decay,
+            self.l1_weight_decay,
+            self.has_l1_weight_decay,
+            self.has_any_wd,
             self.cautious_wd,
             self.wd_towards_init
         )
@@ -641,6 +685,11 @@ class StreamingACLambda(Module):
             self.actor_with_readout_ema.update()
 
         self.critic_ema.update()
+
+        self.update_step.add_(1)
+
+        if self.shrink_perturb_every > 0 and divisible_by(self.update_step.item(), self.shrink_perturb_every):
+            self.shrink_and_perturb_()
 
         return UpdateMetrics(
             td_error = td_error.item(),
@@ -652,6 +701,23 @@ class StreamingACLambda(Module):
             actor_scale = actor_scale.item(),
             critic_scale = critic_scale.item()
         )
+
+    @torch.no_grad()
+    def shrink_and_perturb_(self):
+        def process_params(params):
+            for name, param in params.named_parameters():
+                is_weight = param.ndim == 2
+                if is_weight:
+                    mock_linear = nn.Linear(param.shape[1], param.shape[0], bias=False).to(param.device)
+                    sparse_init_(mock_linear, sparsity=self.init_sparsity)
+                    target = mock_linear.weight
+                else:
+                    target = torch.randn_like(param)
+
+                param.data.lerp_(target, self.shrink_factor)
+
+        process_params(self.actor_with_readout)
+        process_params(self.critic_full)
 
     @torch.no_grad()
     def forward_value(self, state):

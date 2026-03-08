@@ -102,36 +102,36 @@ $ uv run train_lunar.py
 
 ```bibtex
 @misc{daley2025averagingnstepreturnsreduces,
-    title   = {Averaging $n$-step Returns Reduces Variance in Reinforcement Learning}, 
+    title   = {Averaging $n$-step Returns Reduces Variance in Reinforcement Learning},
     author  = {Brett Daley and Martha White and Marlos C. Machado},
     year    = {2025},
     eprint  = {2402.03903},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2402.03903}, 
+    url     = {https://arxiv.org/abs/2402.03903},
 }
 ```
 
 ```bibtex
 @misc{chen2026cautiousweightdecay,
-    title   = {Cautious Weight Decay}, 
+    title   = {Cautious Weight Decay},
     author  = {Lizhang Chen and Jonathan Li and Kaizhao Liang and Baiyu Su and Cong Xie and Nuo Wang Pierse and Chen Liang and Ni Lao and Qiang Liu},
     year    = {2026},
     eprint  = {2510.12402},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2510.12402}, 
+    url     = {https://arxiv.org/abs/2510.12402},
 }
 ```
 
 ```bibtex
 @misc{kumar2024maintainingplasticitycontinuallearning,
-    title   = {Maintaining Plasticity in Continual Learning via Regenerative Regularization}, 
+    title   = {Maintaining Plasticity in Continual Learning via Regenerative Regularization},
     author  = {Saurabh Kumar and Henrik Marklund and Benjamin Van Roy},
     year    = {2024},
     eprint  = {2308.11958},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2308.11958}, 
+    url     = {https://arxiv.org/abs/2308.11958},
 }
 ```

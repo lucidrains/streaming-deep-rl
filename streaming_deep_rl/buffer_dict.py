@@ -19,7 +19,7 @@ class BufferDict(Module):
 
         super().__init__()
         self.key_list = list(key_value_dict.keys())
-        
+
         self.key_map = {k: k.replace('.', '_') for k in self.key_list}
         self.reverse_key_map = {v: k for k, v in self.key_map.items()}
 

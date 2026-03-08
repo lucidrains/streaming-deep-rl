@@ -70,9 +70,9 @@ class Dashboard:
             expand = True
         )
         self.pbar_task = self.progress.add_task("Episodes", total = num_episodes)
-        
+
         self.hyperparams = hyperparams or {}
-        
+
         self.episode_info = {
             "avg_cum_reward_100": 0.0,
             "avg_steps_100": 0.0,
@@ -136,13 +136,18 @@ def main(
     dim_critic = 128,
     enable_pilar = False,
     pilar_mixing_param = 0.5,
-    weight_decay = 0.,
+    l2_weight_decay = 0.,
+    l1_weight_decay = 0.,
     cautious_wd = False,
-    wd_towards_init = False
+    wd_towards_init = False,
+    shrink_perturb_every = 0,
+    shrink_factor = 0.05,
+    perturb_amplitude = 1.0,
+    shrink_towards_init = True
 ):
     if render:
         rmtree(VIDEO_FOLDER, ignore_errors = True)
-        
+
     # accelerator
 
     accelerator = Accelerator(
@@ -222,11 +227,14 @@ def main(
         num_bins = num_bins,
         init_sparsity = init_sparsity,
         delay_steps = delay_steps,
-        enable_pilar = enable_pilar,
-        pilar_mixing_param = pilar_mixing_param,
-        weight_decay = weight_decay,
+        l2_weight_decay = l2_weight_decay,
+        l1_weight_decay = l1_weight_decay,
         cautious_wd = cautious_wd,
-        wd_towards_init = wd_towards_init
+        wd_towards_init = wd_towards_init,
+        shrink_perturb_every = shrink_perturb_every,
+        shrink_factor = shrink_factor,
+        perturb_amplitude = perturb_amplitude,
+        shrink_towards_init = shrink_towards_init
     )
 
     # metrics
@@ -245,9 +253,14 @@ def main(
         init_sparsity = init_sparsity,
         enable_pilar = enable_pilar,
         pilar_mixing_param = pilar_mixing_param,
-        weight_decay = weight_decay,
+        l2_weight_decay = l2_weight_decay,
+        l1_weight_decay = l1_weight_decay,
         cautious_wd = cautious_wd,
-        wd_towards_init = wd_towards_init
+        wd_towards_init = wd_towards_init,
+        shrink_perturb_every = shrink_perturb_every,
+        shrink_factor = shrink_factor,
+        perturb_amplitude = perturb_amplitude,
+        shrink_towards_init = shrink_towards_init
     ))
 
     # training loop
@@ -256,36 +269,36 @@ def main(
         for episode in range(num_episodes):
             state_np, _ = env.reset()
             state = torch.from_numpy(state_np).float().to(device)
-            
+
             eps_reward = 0.0
             eps_steps = 0
-            
+
             # reset eligibility traces
 
             agent.reset_trace_()
 
             for timestep in range(max_timesteps):
-                
+
                 # action
 
                 action_logits = agent.forward_action(state)
                 action = agent.readout.sample(action_logits)
-                
+
                 # step
 
                 next_state_np, reward, terminated, truncated, _ = env.step(int(action.item()))
-                
+
                 reward_t = tensor(reward, dtype = torch.float32, device = device)
                 is_terminal = tensor(terminated, dtype = torch.bool, device = device)
                 next_state = torch.from_numpy(next_state_np).float().to(device)
-                
+
                 # update
 
                 metrics = agent.update(
-                    state = state, 
-                    action = action, 
-                    next_state = next_state, 
-                    reward = reward_t, 
+                    state = state,
+                    action = action,
+                    next_state = next_state,
+                    reward = reward_t,
                     is_terminal = is_terminal,
                     drain = terminated or truncated
                 )
@@ -312,21 +325,21 @@ def main(
 
                 if terminated or truncated:
                     break
-                    
+
             rolling_reward.append(eps_reward)
             rolling_steps.append(eps_steps)
-            
+
             dashboard.advance_progress()
-            
+
             avg_reward = np.mean(rolling_reward)
             avg_steps = np.mean(rolling_steps)
-            
+
             dashboard.update_episode_info(
                 avg_cum_reward_100 = f"{avg_reward:.2f}",
                 avg_steps_100 = f"{avg_steps:.1f}"
             )
-            
+
             live.update(dashboard.create_renderable())
-            
+
 if __name__ == '__main__':
     fire.Fire(main)
