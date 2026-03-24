@@ -311,7 +311,7 @@ class StreamingACLambda(Module):
 
         self.state_norm = ObservationNormalizer(dim_state)
 
-        self.reward_norm = ScaleRewardNormalizer()
+        self.reward_norm = ScaleRewardNormalizer(discount_factor = discount_factor)
 
         # actor
 
