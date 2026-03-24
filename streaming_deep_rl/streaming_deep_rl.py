@@ -267,7 +267,9 @@ class StreamingACLambda(Module):
         delay_steps = 1,
         enable_pilar = False,
         pilar_mixing_param = 0.5,
-        use_critic_ema = True
+        use_critic_ema = True,
+        use_delightful_pg = False,
+        delightful_eta = 1.0
     ):
         super().__init__()
         assert delay_steps > 0, 'delay steps must be greater than 0'
@@ -279,6 +281,11 @@ class StreamingACLambda(Module):
 
         self.enable_pilar = enable_pilar
         self.pilar_mixing_param = pilar_mixing_param
+
+        # delightful pg
+
+        self.use_delightful_pg = use_delightful_pg
+        self.delightful_eta = delightful_eta
 
         # quick validate
 
@@ -551,12 +558,20 @@ class StreamingACLambda(Module):
         td_error_sign = td_error_sign.detach().squeeze()
         value_pred = value_pred.detach()
 
+        # delightful pg
+
+        gate = 1.
+        if self.use_delightful_pg:
+            surprisal = -log_prob.detach()
+            delight = td_error * surprisal
+            gate = (delight / self.delightful_eta).sigmoid()
+
         # update eligibility traces
 
         decay = self.eligibility_trace_decay * self.discount_factor
 
         for name, trace in self.actor_trace.items():
-            trace.mul_(decay).add_(actor_grad[name])
+            trace.mul_(decay).add_(actor_grad[name] * gate)
 
         for name, trace in self.critic_trace.items():
             trace.mul_(decay).add_(value_grad[name])

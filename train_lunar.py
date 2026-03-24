@@ -140,7 +140,9 @@ def main(
     l1_weight_decay = 0.,
     cautious_wd = False,
     wd_towards_init = False,
-    use_critic_ema = True
+    use_critic_ema = True,
+    use_delightful_pg = False,
+    delightful_eta = 1.0
 ):
     if render:
         rmtree(VIDEO_FOLDER, ignore_errors = True)
@@ -228,7 +230,9 @@ def main(
         l1_weight_decay = l1_weight_decay,
         cautious_wd = cautious_wd,
         wd_towards_init = wd_towards_init,
-        use_critic_ema = use_critic_ema
+        use_critic_ema = use_critic_ema,
+        use_delightful_pg = use_delightful_pg,
+        delightful_eta = delightful_eta
     )
 
     # metrics
@@ -251,7 +255,9 @@ def main(
         l1_weight_decay = l1_weight_decay,
         cautious_wd = cautious_wd,
         wd_towards_init = wd_towards_init,
-        use_critic_ema = use_critic_ema
+        use_critic_ema = use_critic_ema,
+        use_delightful_pg = use_delightful_pg,
+        delightful_eta = delightful_eta
     ))
 
     # training loop

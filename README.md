@@ -135,3 +135,15 @@ $ uv run train_lunar.py
     url     = {https://arxiv.org/abs/2308.11958},
 }
 ```
+
+```bibtex
+@misc{osband2026delightfulpolicygradient,
+    title   = {Delightful Policy Gradient},
+    author  = {Ian Osband},
+    year    = {2026},
+    eprint  = {2603.14608},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2603.14608},
+}
+```
