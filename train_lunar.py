@@ -7,6 +7,7 @@
 #   "fire",
 #   "tqdm",
 #   "x-mlps-pytorch>=0.0.8",
+#   "einx",
 #   "rich",
 #   "wandb"
 # ]
@@ -141,6 +142,7 @@ def main(
     cautious_wd = False,
     wd_towards_init = False,
     use_critic_ema = True,
+    use_minto = False,
     use_delightful_pg = False,
     delightful_eta = 1.0
 ):
@@ -231,6 +233,7 @@ def main(
         cautious_wd = cautious_wd,
         wd_towards_init = wd_towards_init,
         use_critic_ema = use_critic_ema,
+        use_minto = use_minto,
         use_delightful_pg = use_delightful_pg,
         delightful_eta = delightful_eta
     )
@@ -256,6 +259,7 @@ def main(
         cautious_wd = cautious_wd,
         wd_towards_init = wd_towards_init,
         use_critic_ema = use_critic_ema,
+        use_minto = use_minto,
         use_delightful_pg = use_delightful_pg,
         delightful_eta = delightful_eta
     ))

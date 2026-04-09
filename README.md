@@ -147,3 +147,13 @@ $ uv run train_lunar.py
     url     = {https://arxiv.org/abs/2603.14608},
 }
 ```
+
+```bibtex
+@inproceedings{hendawy2026use,
+    title   = {Use the Online Network If You Can: Towards Fast and Stable Reinforcement Learning},
+    author  = {Ahmed Hendawy and Henrik Metternich and Th{\'e}o Vincent and Mahdi Kallel and Jan Peters and Carlo D'Eramo},
+    booktitle = {The Fourteenth International Conference on Learning Representations},
+    year    = {2026},
+    url     = {https://openreview.net/forum?id=rFLuaG9Yq6}
+}
+```

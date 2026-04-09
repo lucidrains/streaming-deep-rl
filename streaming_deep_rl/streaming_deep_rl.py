@@ -268,6 +268,7 @@ class StreamingACLambda(Module):
         enable_pilar = False,
         pilar_mixing_param = 0.5,
         use_critic_ema = True,
+        use_minto = False,
         use_delightful_pg = False,
         delightful_eta = 1.0
     ):
@@ -282,6 +283,11 @@ class StreamingACLambda(Module):
         self.enable_pilar = enable_pilar
         self.pilar_mixing_param = pilar_mixing_param
 
+        # minto (use online network if you can)
+
+        assert not (use_minto and not use_critic_ema), 'minto can only be used with critic ema'
+        self.use_minto = use_minto
+
         # delightful pg
 
         self.use_delightful_pg = use_delightful_pg
@@ -291,6 +297,7 @@ class StreamingACLambda(Module):
 
         with torch.no_grad():
             mock_state = torch.randn(dim_state)
+
             actor_embed = actor(mock_state)
             critic_embed = critic(mock_state)
             assert actor_embed.shape[-1] == dim_actor
@@ -478,6 +485,7 @@ class StreamingACLambda(Module):
         """single learning step for the oldest transition in buffer_slice, using n-step return"""
 
         oldest_state, oldest_action, oldest_reward, oldest_next_state, oldest_is_term = buffer_slice[0]
+        last_next_state = buffer_slice[-1][3]
 
         # n-step discounted return
 
@@ -502,12 +510,23 @@ class StreamingACLambda(Module):
             embed = self.critic(oldest_state)
             value_pred = self.hl_gauss_layer(embed)
 
+            # getting the bootstrapped value
+
+            def get_next_value_pred(state):
+                next_value = self.critic_ema(state) if self.use_critic_ema else self.critic_full(state)
+
+                if not self.use_minto:
+                    return next_value
+
+                # Hendawy et al. https://openreview.net/forum?id=rFLuaG9Yq6
+
+                online_next_value = self.critic_full(state)
+                return torch.min(next_value, online_next_value)
+
             # n-step td target
 
             if discount > 0.:
-                last_next_state = buffer_slice[-1][3]
-                next_value_pred = self.critic_ema(last_next_state) if self.use_critic_ema else self.critic_full(last_next_state)
-                td_target = (n_step_return + discount * next_value_pred).detach()
+                td_target = (n_step_return + discount * get_next_value_pred(last_next_state)).detach()
             else:
                 td_target = n_step_return.detach()
 
@@ -518,7 +537,7 @@ class StreamingACLambda(Module):
                 if oldest_is_term.item():
                     td_target_1 = oldest_reward.detach()
                 else:
-                    td_target_1 = (oldest_reward + self.discount_factor * (self.critic_ema(oldest_next_state) if self.use_critic_ema else self.critic_full(oldest_next_state))).detach()
+                    td_target_1 = (oldest_reward + self.discount_factor * get_next_value_pred(oldest_next_state)).detach()
 
                 td_target = torch.lerp(td_target_1, td_target, self.pilar_mixing_param)
 
