@@ -8,9 +8,11 @@ from torch.nn import LayerNorm
 
 @param('actor_self_predict_repr', (False, True))
 @param('critic_self_predict_repr', (False, True))
+@param('spr_target_embed_from_ema', (False, True))
 def test_streaming(
     actor_self_predict_repr,
-    critic_self_predict_repr
+    critic_self_predict_repr,
+    spr_target_embed_from_ema
 ):
 
     from streaming_deep_rl.streaming_deep_rl import (
@@ -31,7 +33,9 @@ def test_streaming(
         dim_actor = 128,
         dim_critic = 128,
         actor_self_predict_repr = actor_self_predict_repr,
-        critic_self_predict_repr = critic_self_predict_repr
+        critic_self_predict_repr = critic_self_predict_repr,
+        spr_target_embed_from_ema = spr_target_embed_from_ema,
+        spr_sigreg_weight = 1.0 if not spr_target_embed_from_ema else 0.0
     )
 
     streaming_actor_critic.reset_trace_()

@@ -9,11 +9,12 @@ import torch.nn.functional as F
 from torch import nn, tensor, is_tensor, cat, stack
 from torch.nn import Module, Linear, Sequential
 
-from einops import reduce
+import einx
+from einops import rearrange, reduce
 
 from discrete_continuous_embed_readout import Readout, Embed
 
-from torch_einops_utils import tree_map_tensor, pack_with_inverse
+from torch_einops_utils import tree_map_tensor, pack_with_inverse, masked_mean
 
 from ema_pytorch import EMA
 
@@ -115,7 +116,8 @@ class SelfPredictRepr(Module):
         num_discrete_actions = 0,
         num_continuous_actions = 0,
         dim_predict = None,
-        target_embed_from_ema = True # whether the target embed is from an EMA, or from the model itself (traditional vs sigreg from lejepa)
+        target_embed_from_ema = True, # whether the target embed is from an EMA, or from the model itself (traditional vs sigreg from lejepa)
+        sigreg_weight = 0.
     ):
         super().__init__()
         assert num_discrete_actions > 0 or num_continuous_actions > 0
@@ -134,6 +136,9 @@ class SelfPredictRepr(Module):
         self.to_prediction = nn.Sequential(
             nn.Linear(dim_predict + dim_embed, dim_predict, bias = False)
         )
+
+        self.apply_sigreg = sigreg_weight > 0.
+        self.sigreg_weight = sigreg_weight
 
     def forward(
         self,
@@ -155,7 +160,54 @@ class SelfPredictRepr(Module):
 
         # cosine sim loss
 
-        return F.mse_loss(l2norm(predicted), l2norm(next_projected))
+        loss = F.mse_loss(l2norm(predicted), l2norm(next_projected))
+
+        if not self.apply_sigreg:
+            return loss
+
+        return loss + self.sigreg_weight * sigreg_loss(projected)
+
+# sigreg from lejepa
+
+def sigreg_loss(
+    x,
+    num_slices = 1024,
+    domain = (-5, 5),
+    num_knots = 17,
+    mask = None
+):
+    # Randall Balestriero - https://arxiv.org/abs/2511.08544
+
+    dim, device = x.shape[-1], x.device
+
+    # slice sampling
+
+    rand_projs = torch.randn((num_slices, dim), device = device)
+    rand_projs = l2norm(rand_projs)
+
+    # integration points
+
+    t = torch.linspace(*domain, num_knots, device = device)
+
+    # theoretical CF for N(0, 1) and Gauss. window
+
+    exp_f = (-0.5 * t.square()).exp()
+
+    # empirical CF
+
+    x_t = einx.dot('... d, m d -> (...) m', x, rand_projs)
+
+    x_t = einx.multiply('n m, t -> n m t', x_t, t)
+    ecf = (1j * x_t).exp()
+
+    mask_1d = rearrange(mask, '... -> (...)') if exists(mask) else None
+    ecf = masked_mean(ecf, mask_1d, dim = 0)
+
+    # weighted L2 distance
+
+    err = ecf.sub(exp_f).abs().square().mul(exp_f)
+
+    return torch.trapz(err, t, dim = -1).mean()
 
 # online normalization from Welford in 1962
 
@@ -332,6 +384,8 @@ class StreamingACLambda(Module):
         critic_ema_beta = 0.7,
         actor_self_predict_repr = False,
         critic_self_predict_repr = False,
+        spr_target_embed_from_ema = True,
+        spr_sigreg_weight = 0.,
         entropy_weight = 0.01,
         init_sparsity = 0.9,
         dim_critic = 128,
@@ -406,22 +460,28 @@ class StreamingACLambda(Module):
 
         if actor_self_predict_repr:
 
-            actor_use_ema |= True
+            if spr_target_embed_from_ema:
+                actor_use_ema |= True
 
             self.actor_spr = SelfPredictRepr(
                 dim_actor,
                 num_discrete_actions = num_discrete_actions,
                 num_continuous_actions = num_continuous_actions,
+                target_embed_from_ema = spr_target_embed_from_ema,
+                sigreg_weight = spr_sigreg_weight
             )
 
         if critic_self_predict_repr:
 
-            use_critic_ema |= True
+            if spr_target_embed_from_ema:
+                use_critic_ema |= True
 
             self.critic_spr = SelfPredictRepr(
                 dim_critic,
                 num_discrete_actions = num_discrete_actions,
                 num_continuous_actions = num_continuous_actions,
+                target_embed_from_ema = spr_target_embed_from_ema,
+                sigreg_weight = spr_sigreg_weight
             )
 
         # actor

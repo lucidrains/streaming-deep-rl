@@ -1,6 +1,6 @@
 [project]
 name = "streaming-deep-rl"
-version = "0.2.2"
+version = "0.2.4"
 description = "Streaming Deep Reinforcement Learning"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -25,6 +25,7 @@ classifiers=[
 
 dependencies = [
     "discrete-continuous-embed-readout>=0.2.0",
+    "einx>=0.3.0",
     "einops>=0.8.1",
     "ema-pytorch",
     "hl-gauss-pytorch",

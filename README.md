@@ -179,3 +179,15 @@ $ uv run train_lunar.py
     url     = {https://arxiv.org/abs/2602.09396},
 }
 ```
+
+```bibtex
+@misc{maes2026leworldmodelstableendtoendjointembedding,
+    title   = {LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels}, 
+    author  = {Lucas Maes and Quentin Le Lidec and Damien Scieur and Yann LeCun and Randall Balestriero},
+    year    = {2026},
+    eprint  = {2603.19312},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2603.19312}, 
+}
+```
