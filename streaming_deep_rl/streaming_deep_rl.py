@@ -1,6 +1,7 @@
 from __future__ import annotations
 import math
 from collections import deque
+from contextlib import nullcontext
 from typing import Callable, NamedTuple
 
 import torch
@@ -25,11 +26,20 @@ from streaming_deep_rl.buffer_dict import BufferDict
 def exists(v):
     return v is not None
 
+def identity(t):
+    return t
+
 def divisible_by(num, den):
     return (num % den) == 0
 
 def default(v, d):
     return v if exists(v) else d
+
+def no_grad_detach(fn):
+    def inner(t):
+        with torch.no_grad():
+            return fn(t).detach()
+    return inner
 
 def cast_tensor(t):
     return tensor(t) if not is_tensor(t) else t
@@ -104,7 +114,8 @@ class SelfPredictRepr(Module):
         dim_embed,
         num_discrete_actions = 0,
         num_continuous_actions = 0,
-        dim_predict = None
+        dim_predict = None,
+        target_embed_from_ema = True # whether the target embed is from an EMA, or from the model itself (traditional vs sigreg from lejepa)
     ):
         super().__init__()
         assert num_discrete_actions > 0 or num_continuous_actions > 0
@@ -112,6 +123,8 @@ class SelfPredictRepr(Module):
         dim_predict = default(dim_predict, dim_embed)
 
         self.to_action_embed = Embed(dim_embed, num_discrete = num_discrete_actions, num_continuous = num_continuous_actions)
+
+        self.target_embed_from_ema = target_embed_from_ema
 
         self.to_projection = nn.Sequential(
             nn.RMSNorm(dim_embed),
@@ -130,8 +143,11 @@ class SelfPredictRepr(Module):
     ):
         projected = self.to_projection(state_embed)
 
-        with torch.no_grad():
-            next_projected = self.to_projection(next_state_embed.detach())
+        # maybe no
+
+        decorator = no_grad_detach if self.target_embed_from_ema else identity
+
+        next_projected = decorator(self.to_projection)(next_state_embed)
 
         action_embed = self.to_action_embed(actions)
 
