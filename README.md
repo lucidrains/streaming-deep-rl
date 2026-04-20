@@ -4,8 +4,6 @@
 
 Explorations into the proposed [Streaming Deep Reinforcement Learning](https://arxiv.org/abs/2410.14606), from University of Alberta.
 
-Once completed, if it checks out, will reach to integrate the Stream Q(λ) with [Q-Transformer](https://codeberg.org/lucidrains/q-transformer).
-
 A recent testimony to Streaming AC(λ) variant can be found [here](https://blog.9600baud.net/streaming-deep-rl-honeypot.html). Will be incorporated into the repository as well with a few improvements.
 
 [Paper reading](https://www.youtube.com/live/5NFAzluHkcY) by Youtube AI/ML educator [@hu-po](https://www.youtube.com/@hu-po).
@@ -155,5 +153,29 @@ $ uv run train_lunar.py
     booktitle = {The Fourteenth International Conference on Learning Representations},
     year    = {2026},
     url     = {https://openreview.net/forum?id=rFLuaG9Yq6}
+}
+```
+
+```bibtex
+@misc{schwarzer2021dataefficientreinforcementlearningselfpredictive,
+    title   = {Data-Efficient Reinforcement Learning with Self-Predictive Representations},
+    author  = {Max Schwarzer and Ankesh Anand and Rishab Goel and R Devon Hjelm and Aaron Courville and Philip Bachman},
+    year    = {2021},
+    eprint  = {2007.05929},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2007.05929},
+}
+```
+
+```bibtex
+@misc{nilaksh2026squeezingstreamlearning,
+    title   = {Squeezing More from the Stream : Learning Representation Online for Streaming Reinforcement Learning},
+    author  = {Nilaksh and Antoine Clavaud and Mathieu Reymond and François Rivest and Sarath Chandar},
+    year    = {2026},
+    eprint  = {2602.09396},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2602.09396},
 }
 ```

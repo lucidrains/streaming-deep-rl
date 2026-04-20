@@ -5,14 +5,14 @@ from typing import Callable, NamedTuple
 
 import torch
 import torch.nn.functional as F
-from torch import nn, tensor, is_tensor
+from torch import nn, tensor, is_tensor, cat, stack
 from torch.nn import Module, Linear, Sequential
 
 from einops import reduce
 
-from discrete_continuous_embed_readout import Readout
+from discrete_continuous_embed_readout import Readout, Embed
 
-from torch_einops_utils import tree_map_tensor
+from torch_einops_utils import tree_map_tensor, pack_with_inverse
 
 from ema_pytorch import EMA
 
@@ -37,6 +37,8 @@ def cast_tensor(t):
 def to_device(tree, device):
     return tree_map_tensor(lambda t: t.to(device), tree)
 
+def l2norm(t):
+    return F.normalize(t, p = 2, dim = -1)
 
 # return types
 
@@ -80,6 +82,64 @@ def sparse_init_(
     if exists(bias):
         nn.init.zeros_(bias)
 
+# orthogonal projection for SPR in streaming setting
+# https://arxiv.org/abs/2602.09396
+
+def orthogonal_project(x, y):
+    x, inverse = pack_with_inverse(x, '*')
+    y, _ = pack_with_inverse(y, '*')
+
+    dtype = x.dtype
+    x, y = x.double(), y.double()
+    unit = l2norm(y)
+
+    parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
+    orthogonal = x - parallel
+
+    return inverse(orthogonal).to(dtype)
+
+class SelfPredictRepr(Module):
+    def __init__(
+        self,
+        dim_embed,
+        num_discrete_actions = 0,
+        num_continuous_actions = 0,
+        dim_predict = None
+    ):
+        super().__init__()
+        assert num_discrete_actions > 0 or num_continuous_actions > 0
+
+        dim_predict = default(dim_predict, dim_embed)
+
+        self.to_action_embed = Embed(dim_embed, num_discrete = num_discrete_actions, num_continuous = num_continuous_actions)
+
+        self.to_projection = nn.Sequential(
+            nn.RMSNorm(dim_embed),
+            nn.Linear(dim_embed, dim_predict, bias = False)
+        )
+
+        self.to_prediction = nn.Sequential(
+            nn.Linear(dim_predict + dim_embed, dim_predict, bias = False)
+        )
+
+    def forward(
+        self,
+        state_embed,
+        actions,
+        next_state_embed
+    ):
+        projected = self.to_projection(state_embed)
+
+        with torch.no_grad():
+            next_projected = self.to_projection(next_state_embed.detach())
+
+        action_embed = self.to_action_embed(actions)
+
+        predicted = self.to_prediction(cat((projected, action_embed), dim = -1))
+
+        # cosine sim loss
+
+        return F.mse_loss(l2norm(predicted), l2norm(next_projected))
 
 # online normalization from Welford in 1962
 
@@ -254,6 +314,7 @@ class StreamingACLambda(Module):
         actor_use_ema = False,
         actor_ema_beta = 0.7,
         critic_ema_beta = 0.7,
+        self_predict_repr = False,
         entropy_weight = 0.01,
         init_sparsity = 0.9,
         dim_critic = 128,
@@ -319,6 +380,21 @@ class StreamingACLambda(Module):
         self.state_norm = ObservationNormalizer(dim_state)
 
         self.reward_norm = ScaleRewardNormalizer(discount_factor = discount_factor)
+
+        # self-predictive representation
+        # Schwarzer et al. https://arxiv.org/abs/2007.05929
+
+        self.self_predict_repr = self_predict_repr
+
+        if self_predict_repr:
+
+            actor_use_ema |= True
+
+            self.actor_self_predict_repr = SelfPredictRepr(
+                dim_actor,
+                num_discrete_actions = num_discrete_actions,
+                num_continuous_actions = num_continuous_actions,
+            )
 
         # actor
 
@@ -564,14 +640,43 @@ class StreamingACLambda(Module):
             log_prob = self.readout.log_prob(action_logits, oldest_action).mean()
             entropy = self.readout.entropy(action_logits).mean()
 
-            actor_loss = log_prob + self.entropy_weight * td_error_sign * entropy
+            actor_loss = log_prob
 
             actor_params = list(self.actor_with_readout.parameters())
 
-            # policy and entropy gradient goes into the eligibility trace
+            # policy gradient goes into the eligibility trace
 
             actor_loss_grads = torch.autograd.grad(actor_loss, actor_params, retain_graph = True)
             actor_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), actor_loss_grads)}
+
+            # get the SPR loss
+
+            actor_spr_grad = None
+            if self.self_predict_repr:
+                actor_embed = self.actor(oldest_state)
+
+                if self.actor_use_ema:
+                    actor_next_embed = self.actor_with_readout_ema.ema_model[0](last_next_state)
+                else:
+                    actor_next_embed = self.actor(last_next_state)
+
+                spr_loss = self.actor_self_predict_repr(actor_embed, oldest_action, actor_next_embed)
+
+                spr_params = list(self.actor_self_predict_repr.parameters())
+                spr_grads_tup = torch.autograd.grad(spr_loss, actor_params + spr_params, retain_graph = True, allow_unused = True)
+                spr_grads_tup = tuple(default(g, torch.zeros_like(p)) for g, p in zip(spr_grads_tup, actor_params + spr_params))
+
+                actor_spr_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), spr_grads_tup[:len(actor_params)])}
+                spr_only_grad = spr_grads_tup[len(actor_params):]
+
+                # Update SPR networks via SGD
+                for param, grad in zip(spr_params, spr_only_grad):
+                    param.data.add_(grad, alpha = -self.actor_lr)
+
+            # entropy gradient decoupled from td_error
+
+            entropy_grads_tup = torch.autograd.grad(entropy, actor_params, retain_graph = True)
+            entropy_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), entropy_grads_tup)}
 
         td_error = td_error.detach().squeeze()
         td_error_sign = td_error_sign.detach().squeeze()
@@ -608,7 +713,7 @@ class StreamingACLambda(Module):
             bias_correction1 = 1. - self.adam_beta1 ** step
             bias_correction2 = 1. - self.adam_beta2 ** step
 
-        def update_params(params, init_params, traces, ms, vs, kappa, lr, l2_wd, has_l2_wd, l1_wd, has_l1_wd, has_any_wd, cautious_wd, wd_towards_init):
+        def update_params(params, init_params, traces, ms, vs, kappa, lr, l2_wd, has_l2_wd, l1_wd, has_l1_wd, has_any_wd, cautious_wd, wd_towards_init, aux_grads = None, spr_grads = None):
             if self.adaptive:
                 # update first and second moments of semi-gradients
 
@@ -643,6 +748,14 @@ class StreamingACLambda(Module):
 
             for name, param in params.named_parameters():
                 update = adapted_grads[name] * global_scale * lr
+
+                if exists(aux_grads):
+                    update = update + aux_grads[name] * self.entropy_weight * global_scale * lr
+
+                if exists(spr_grads) and name in spr_grads:
+                    spr_update = -spr_grads[name] * lr
+                    spr_update = orthogonal_project(spr_update, update)
+                    update = update + spr_update
 
                 # add gradient update first
 
@@ -686,7 +799,9 @@ class StreamingACLambda(Module):
             self.has_l1_weight_decay,
             self.has_any_wd,
             self.cautious_wd,
-            self.wd_towards_init
+            self.wd_towards_init,
+            entropy_grad,
+            actor_spr_grad
         )
 
         critic_trace_norm, critic_scale = update_params(
@@ -703,7 +818,9 @@ class StreamingACLambda(Module):
             self.has_l1_weight_decay,
             self.has_any_wd,
             self.cautious_wd,
-            self.wd_towards_init
+            self.wd_towards_init,
+            None,
+            None
         )
 
         if self.actor_use_ema:
@@ -756,38 +873,3 @@ class StreamingACLambda(Module):
         sample = False
     ):
         return self.forward_action(state, sample = sample)
-
-# streaming Q variant
-
-class StreamingQLambda(Module):
-    def __init__(
-        self,
-        network: Module
-    ):
-        super().__init__()
-        self.network = network
-
-        # sparse init
-
-        self.apply(self.init_)
-
-    def init_(self, module):
-        if not isinstance(module, Linear):
-            return
-
-        sparse_init_(module)
-
-    def update(
-        self,
-        state,
-        action,
-        next_state,
-        rewards
-    ):
-        raise NotImplementedError
-
-    def forward(
-        self,
-        state
-    ):
-        raise NotImplementedError
