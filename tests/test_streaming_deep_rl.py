@@ -6,9 +6,11 @@ param = pytest.mark.parametrize
 import torch
 from torch.nn import LayerNorm
 
-@param('self_predict_repr', (False, True))
+@param('actor_self_predict_repr', (False, True))
+@param('critic_self_predict_repr', (False, True))
 def test_streaming(
-    self_predict_repr
+    actor_self_predict_repr,
+    critic_self_predict_repr
 ):
 
     from streaming_deep_rl.streaming_deep_rl import (
@@ -28,7 +30,8 @@ def test_streaming(
         dim_state = 5,
         dim_actor = 128,
         dim_critic = 128,
-        self_predict_repr = self_predict_repr
+        actor_self_predict_repr = actor_self_predict_repr,
+        critic_self_predict_repr = critic_self_predict_repr
     )
 
     streaming_actor_critic.reset_trace_()

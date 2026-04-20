@@ -314,7 +314,8 @@ class StreamingACLambda(Module):
         actor_use_ema = False,
         actor_ema_beta = 0.7,
         critic_ema_beta = 0.7,
-        self_predict_repr = False,
+        actor_self_predict_repr = False,
+        critic_self_predict_repr = False,
         entropy_weight = 0.01,
         init_sparsity = 0.9,
         dim_critic = 128,
@@ -384,14 +385,25 @@ class StreamingACLambda(Module):
         # self-predictive representation
         # Schwarzer et al. https://arxiv.org/abs/2007.05929
 
-        self.self_predict_repr = self_predict_repr
+        self.actor_self_predict_repr = actor_self_predict_repr
+        self.critic_self_predict_repr = critic_self_predict_repr
 
-        if self_predict_repr:
+        if actor_self_predict_repr:
 
             actor_use_ema |= True
 
-            self.actor_self_predict_repr = SelfPredictRepr(
+            self.actor_spr = SelfPredictRepr(
                 dim_actor,
+                num_discrete_actions = num_discrete_actions,
+                num_continuous_actions = num_continuous_actions,
+            )
+
+        if critic_self_predict_repr:
+
+            use_critic_ema |= True
+
+            self.critic_spr = SelfPredictRepr(
+                dim_critic,
                 num_discrete_actions = num_discrete_actions,
                 num_continuous_actions = num_continuous_actions,
             )
@@ -652,7 +664,7 @@ class StreamingACLambda(Module):
             # get the SPR loss
 
             actor_spr_grad = None
-            if self.self_predict_repr:
+            if self.actor_self_predict_repr:
                 actor_embed = self.actor(oldest_state)
 
                 if self.actor_use_ema:
@@ -660,9 +672,9 @@ class StreamingACLambda(Module):
                 else:
                     actor_next_embed = self.actor(last_next_state)
 
-                spr_loss = self.actor_self_predict_repr(actor_embed, oldest_action, actor_next_embed)
+                spr_loss = self.actor_spr(actor_embed, oldest_action, actor_next_embed)
 
-                spr_params = list(self.actor_self_predict_repr.parameters())
+                spr_params = list(self.actor_spr.parameters())
                 spr_grads_tup = torch.autograd.grad(spr_loss, actor_params + spr_params, retain_graph = True, allow_unused = True)
                 spr_grads_tup = tuple(default(g, torch.zeros_like(p)) for g, p in zip(spr_grads_tup, actor_params + spr_params))
 
@@ -672,6 +684,30 @@ class StreamingACLambda(Module):
                 # Update SPR networks via SGD
                 for param, grad in zip(spr_params, spr_only_grad):
                     param.data.add_(grad, alpha = -self.actor_lr)
+
+            # critic SPR loss
+
+            critic_spr_grad = None
+            if self.critic_self_predict_repr:
+                critic_embed = self.critic(oldest_state)
+
+                if self.use_critic_ema:
+                    critic_next_embed = self.critic_ema.ema_model[0](last_next_state)
+                else:
+                    critic_next_embed = self.critic(last_next_state)
+
+                critic_spr_loss = self.critic_spr(critic_embed, oldest_action, critic_next_embed)
+
+                critic_spr_params = list(self.critic_spr.parameters())
+                critic_spr_grads_tup = torch.autograd.grad(critic_spr_loss, critic_params + critic_spr_params, retain_graph = True, allow_unused = True)
+                critic_spr_grads_tup = tuple(default(g, torch.zeros_like(p)) for g, p in zip(critic_spr_grads_tup, critic_params + critic_spr_params))
+
+                critic_spr_grad = {name: grad for (name, _), grad in zip(self.critic_full.named_parameters(), critic_spr_grads_tup[:len(critic_params)])}
+                critic_spr_only_grad = critic_spr_grads_tup[len(critic_params):]
+
+                # Update SPR networks via SGD
+                for param, grad in zip(critic_spr_params, critic_spr_only_grad):
+                    param.data.add_(grad, alpha = -self.critic_lr)
 
             # entropy gradient decoupled from td_error
 
@@ -820,7 +856,7 @@ class StreamingACLambda(Module):
             self.cautious_wd,
             self.wd_towards_init,
             None,
-            None
+            critic_spr_grad
         )
 
         if self.actor_use_ema:
