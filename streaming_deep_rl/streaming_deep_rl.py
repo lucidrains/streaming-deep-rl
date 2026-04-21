@@ -20,6 +20,8 @@ from ema_pytorch import EMA
 
 from hl_gauss_pytorch import HLGaussLayer
 
+from x_mlps_pytorch import MLP
+
 from streaming_deep_rl.buffer_dict import BufferDict
 
 # helpers
@@ -117,12 +119,14 @@ class SelfPredictRepr(Module):
         num_continuous_actions = 0,
         dim_predict = None,
         target_embed_from_ema = True, # whether the target embed is from an EMA, or from the model itself (traditional vs sigreg from lejepa)
-        sigreg_weight = 0.
+        sigreg_weight = 0.,
+        dim_hidden_expand_factor = 4
     ):
         super().__init__()
         assert num_discrete_actions > 0 or num_continuous_actions > 0
 
         dim_predict = default(dim_predict, dim_embed)
+        dim_mlp_hidden = int(dim_embed * dim_hidden_expand_factor)
 
         self.to_action_embed = Embed(dim_embed, num_discrete = num_discrete_actions, num_continuous = num_continuous_actions)
 
@@ -130,12 +134,10 @@ class SelfPredictRepr(Module):
 
         self.to_projection = nn.Sequential(
             nn.RMSNorm(dim_embed),
-            nn.Linear(dim_embed, dim_predict, bias = False)
+            MLP(dim_embed, dim_mlp_hidden, dim_predict)
         )
 
-        self.to_prediction = nn.Sequential(
-            nn.Linear(dim_predict + dim_embed, dim_predict, bias = False)
-        )
+        self.to_prediction = MLP(dim_predict + dim_embed, dim_mlp_hidden, dim_predict)
 
         self.apply_sigreg = sigreg_weight > 0.
         self.sigreg_weight = sigreg_weight
@@ -386,6 +388,7 @@ class StreamingACLambda(Module):
         critic_self_predict_repr = False,
         spr_target_embed_from_ema = True,
         spr_sigreg_weight = 0.,
+        spr_dim_hidden_expand_factor = 4,
         entropy_weight = 0.01,
         init_sparsity = 0.9,
         dim_critic = 128,
@@ -468,7 +471,8 @@ class StreamingACLambda(Module):
                 num_discrete_actions = num_discrete_actions,
                 num_continuous_actions = num_continuous_actions,
                 target_embed_from_ema = spr_target_embed_from_ema,
-                sigreg_weight = spr_sigreg_weight
+                sigreg_weight = spr_sigreg_weight,
+                dim_hidden_expand_factor = spr_dim_hidden_expand_factor
             )
 
         if critic_self_predict_repr:
@@ -481,7 +485,8 @@ class StreamingACLambda(Module):
                 num_discrete_actions = num_discrete_actions,
                 num_continuous_actions = num_continuous_actions,
                 target_embed_from_ema = spr_target_embed_from_ema,
-                sigreg_weight = spr_sigreg_weight
+                sigreg_weight = spr_sigreg_weight,
+                dim_hidden_expand_factor = spr_dim_hidden_expand_factor
             )
 
         # actor
