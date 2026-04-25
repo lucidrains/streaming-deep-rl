@@ -638,7 +638,6 @@ class StreamingACLambda(Module):
                 'critic': BufferDict({name: param.detach().clone() for name, param in self.critic_full.named_parameters()})
             })
 
-        # set actor and critic lambda if eligibility trace is used
 
     def save(self, path, overwrite = True):
         path = Path(path)
@@ -722,6 +721,7 @@ class StreamingACLambda(Module):
 
             # getting the bootstrapped value
 
+            @torch.no_grad()
             def get_next_value_pred(state):
                 next_value = self.critic_ema(state) if self.use_critic_ema else self.critic_full(state)
 
@@ -749,10 +749,11 @@ class StreamingACLambda(Module):
                 value_loss = self.hl_gauss_layer(critic_embed, td_target)
                 critic_trace_grads = torch.autograd.grad(value_loss, critic_params, retain_graph=True, allow_unused=True)
 
-                safe_delta = torch.where(td_error.detach() >= 0, 1.0, -1.0) * td_error.detach().abs().clamp(min = 1e-6)
-                critic_trace_grads = [(-grad / safe_delta) if exists(grad) else None for grad in critic_trace_grads]
+                safe_delta = torch.where(td_error.detach() >= 0, 1.0, -1.0) * td_error.detach().abs().clamp(min = 1.0)
+                critic_trace_grads = [(-grad / safe_delta) if exists(grad) else torch.zeros_like(p) for grad, p in zip(critic_trace_grads, critic_params)]
             else:
                 critic_trace_grads = torch.autograd.grad(value_pred, critic_params, retain_graph=True, allow_unused=True)
+                critic_trace_grads = [default(grad, torch.zeros_like(p)) for grad, p in zip(critic_trace_grads, critic_params)]
 
             value_grad = {
                 name: grad
