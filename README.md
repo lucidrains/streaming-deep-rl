@@ -184,3 +184,15 @@ $ uv run train_lunar.py
     url     = {https://arxiv.org/abs/2603.19312},
 }
 ```
+
+```bibtex
+@misc{lavoie2022simplicialembeddingsselfsupervisedlearning,
+    title   = {Simplicial Embeddings in Self-Supervised Learning and Downstream Classification},
+    author  = {Samuel Lavoie and Christos Tsirigotis and Max Schwarzer and Ankit Vani and Michael Noukhovitch and Kenji Kawaguchi and Aaron Courville},
+    year    = {2022},
+    eprint  = {2204.00616},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2204.00616},
+}
+```

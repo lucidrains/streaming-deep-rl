@@ -6,10 +6,12 @@ import torch
 @param('actor_self_predict_repr', (False, True))
 @param('critic_self_predict_repr', (False, True))
 @param('spr_target_embed_from_ema', (False, True))
+@param('spr_use_sem', (False, True))
 def test_streaming(
     actor_self_predict_repr,
     critic_self_predict_repr,
-    spr_target_embed_from_ema
+    spr_target_embed_from_ema,
+    spr_use_sem
 ):
 
     from streaming_deep_rl.streaming_deep_rl import (
@@ -32,7 +34,8 @@ def test_streaming(
         actor_self_predict_repr = actor_self_predict_repr,
         critic_self_predict_repr = critic_self_predict_repr,
         spr_target_embed_from_ema = spr_target_embed_from_ema,
-        spr_sigreg_weight = 1.0 if not spr_target_embed_from_ema else 0.0
+        spr_sigreg_weight = 1.0 if not spr_target_embed_from_ema else 0.0,
+        spr_use_sem = spr_use_sem
     )
 
     streaming_actor_critic.reset_trace_()

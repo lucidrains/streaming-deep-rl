@@ -122,6 +122,35 @@ def orthog_project(x, y):
 
     return orthog.to(dtype)
 
+# Simplicial Embeddings
+# Lavoie et al - https://arxiv.org/abs/2204.00616
+
+class SEM(Module):
+    def __init__(
+        self,
+        dim,
+        temperature = 0.1,
+        dim_simplex = 8,
+        pre_layernorm = False
+    ):
+        super().__init__()
+        assert divisible_by(dim, dim_simplex), f'{dim} must be divisible by {dim_simplex}'
+
+        self.dim = dim
+        self.dim_simplex = dim_simplex
+        self.temperature = temperature
+
+        self.norm = nn.LayerNorm(dim, bias = False) if pre_layernorm else nn.Identity()
+
+    def forward(
+        self,
+        t
+    ):
+        t = self.norm(t)
+        t = rearrange(t, '... (l v) -> ... l v', v = self.dim_simplex)
+        t = (t / self.temperature).softmax(dim = -1)
+        return rearrange(t, '... l v -> ... (l v)')
+
 
 class SelfPredictRepr(Module):
     def __init__(
@@ -132,7 +161,10 @@ class SelfPredictRepr(Module):
         dim_predict = None,
         target_embed_from_ema = True, # whether the target embed is from an EMA, or from the model itself (traditional vs sigreg from lejepa)
         sigreg_weight = 0.,
-        dim_hidden_expand_factor = 4
+        dim_hidden_expand_factor = 4,
+        use_sem = False,
+        sem_dim_simplex = 8,
+        sem_temperature = 0.1
     ):
         super().__init__()
         assert num_discrete_actions > 0 or num_continuous_actions > 0
@@ -154,6 +186,9 @@ class SelfPredictRepr(Module):
         self.apply_sigreg = sigreg_weight > 0.
         self.sigreg_weight = sigreg_weight
 
+        self.use_sem = use_sem
+        self.sem = SEM(dim_predict, temperature = sem_temperature, dim_simplex = sem_dim_simplex) if use_sem else nn.Identity()
+
     def forward(
         self,
         state_embed,
@@ -167,6 +202,10 @@ class SelfPredictRepr(Module):
         decorator = no_grad_detach if self.target_embed_from_ema else identity
 
         next_projected = decorator(self.to_projection)(next_state_embed)
+
+        if self.use_sem:
+            projected = self.sem(projected)
+            next_projected = self.sem(next_projected)
 
         action_embed = self.to_action_embed(actions)
 
@@ -401,6 +440,9 @@ class StreamingACLambda(Module):
         spr_target_embed_from_ema = True,
         spr_sigreg_weight = 0.,
         spr_dim_hidden_expand_factor = 4,
+        spr_use_sem = False,
+        spr_sem_dim_simplex = 8,
+        spr_sem_temperature = 0.1,
         spr_lr = 5e-2,
         spr_lr_param_update = 1.,
         spr_orth_beta = 0.9,
@@ -494,25 +536,22 @@ class StreamingACLambda(Module):
 
         # self-predictive representations (Nilaksh et al. 2026)
 
+        spr_kwargs = dict(
+            num_discrete_actions = num_discrete_actions,
+            num_continuous_actions = num_continuous_actions,
+            target_embed_from_ema = spr_target_embed_from_ema,
+            sigreg_weight = spr_sigreg_weight,
+            dim_hidden_expand_factor = spr_dim_hidden_expand_factor,
+            use_sem = spr_use_sem,
+            sem_dim_simplex = spr_sem_dim_simplex,
+            sem_temperature = spr_sem_temperature
+        )
+
         if actor_self_predict_repr:
-            self.actor_spr = SelfPredictRepr(
-                dim_readout_input,
-                num_discrete_actions = num_discrete_actions,
-                num_continuous_actions = num_continuous_actions,
-                target_embed_from_ema = spr_target_embed_from_ema,
-                sigreg_weight = spr_sigreg_weight,
-                dim_hidden_expand_factor = spr_dim_hidden_expand_factor
-            )
+            self.actor_spr = SelfPredictRepr(dim_readout_input, **spr_kwargs)
 
         if critic_self_predict_repr:
-            self.critic_spr = SelfPredictRepr(
-                dim_critic,
-                num_discrete_actions = num_discrete_actions,
-                num_continuous_actions = num_continuous_actions,
-                target_embed_from_ema = spr_target_embed_from_ema,
-                sigreg_weight = spr_sigreg_weight,
-                dim_hidden_expand_factor = spr_dim_hidden_expand_factor
-            )
+            self.critic_spr = SelfPredictRepr(dim_critic, **spr_kwargs)
 
         # td related
 
