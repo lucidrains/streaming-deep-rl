@@ -45,7 +45,6 @@ agent = StreamingACLambda(
     dim_state = 8,
     dim_actor = 128,
     num_discrete_actions = 4,
-    delay_steps = 7 # 7-step TD works well for me. next step TD tends to hit a performance wall
 )
 
 # get action from state and pass to environment or world model
@@ -68,6 +67,12 @@ agent.update(
     reward = reward,
     is_terminal = done
 )
+```
+
+## Cartpole
+
+```bash
+$ uv run train_cartpole.py --spr
 ```
 
 ## Lunar Lander
@@ -95,18 +100,6 @@ $ uv run train_lunar.py
     year    = {2024},
     volume  = {abs/2405.16158},
     url     = {https://api.semanticscholar.org/CorpusID:270063045}
-}
-```
-
-```bibtex
-@misc{daley2025averagingnstepreturnsreduces,
-    title   = {Averaging $n$-step Returns Reduces Variance in Reinforcement Learning},
-    author  = {Brett Daley and Martha White and Marlos C. Machado},
-    year    = {2025},
-    eprint  = {2402.03903},
-    archivePrefix = {arXiv},
-    primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2402.03903},
 }
 ```
 
@@ -182,12 +175,12 @@ $ uv run train_lunar.py
 
 ```bibtex
 @misc{maes2026leworldmodelstableendtoendjointembedding,
-    title   = {LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels}, 
+    title   = {LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels},
     author  = {Lucas Maes and Quentin Le Lidec and Damien Scieur and Yann LeCun and Randall Balestriero},
     year    = {2026},
     eprint  = {2603.19312},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2603.19312}, 
+    url     = {https://arxiv.org/abs/2603.19312},
 }
 ```

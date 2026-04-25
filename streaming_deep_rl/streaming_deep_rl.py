@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+from pathlib import Path
 from collections import deque
 from contextlib import nullcontext
 from typing import Callable, NamedTuple
@@ -11,6 +12,7 @@ from torch.nn import Module, Linear, Sequential
 
 import einx
 from einops import rearrange, reduce
+from einops.layers.torch import Rearrange
 
 from discrete_continuous_embed_readout import Readout, Embed
 
@@ -32,6 +34,9 @@ def exists(v):
 def identity(t):
     return t
 
+def first(t):
+    return t[0]
+
 def divisible_by(num, den):
     return (num % den) == 0
 
@@ -44,8 +49,9 @@ def no_grad_detach(fn):
             return fn(t).detach()
     return inner
 
-def cast_tensor(t):
-    return tensor(t) if not is_tensor(t) else t
+def cast_tensor(t, dtype = None, device = None):
+    t = tensor(t, dtype = dtype) if not is_tensor(t) else t
+    return t if not exists(device) else t.to(device)
 
 def to_device(tree, device):
     return tree_map_tensor(lambda t: t.to(device), tree)
@@ -98,18 +104,24 @@ def sparse_init_(
 # orthogonal projection for SPR in streaming setting
 # https://arxiv.org/abs/2602.09396
 
-def orthogonal_project(x, y):
-    x, inverse = pack_with_inverse(x, '*')
+def orthog_project(x, y):
+    x, inverse_pack = pack_with_inverse(x, '*')
     y, _ = pack_with_inverse(y, '*')
 
     dtype = x.dtype
-    x, y = x.double(), y.double()
+
+    if x.device.type != 'mps':
+        x, y = x.double(), y.double()
+
     unit = l2norm(y)
 
     parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
-    orthogonal = x - parallel
+    orthog = x - parallel
 
-    return inverse(orthogonal).to(dtype)
+    orthog = inverse_pack(orthog, '*')
+
+    return orthog.to(dtype)
+
 
 class SelfPredictRepr(Module):
     def __init__(
@@ -389,34 +401,21 @@ class StreamingACLambda(Module):
         spr_target_embed_from_ema = True,
         spr_sigreg_weight = 0.,
         spr_dim_hidden_expand_factor = 4,
+        spr_lr = 1e-3,
+        spr_orth_beta = 0.9,
         entropy_weight = 0.01,
         init_sparsity = 0.9,
         dim_critic = 128,
-        val_min = -3.,
-        val_max = 3.,
-        num_bins = 64,
         l2_weight_decay = 0.,
         l1_weight_decay = 0.,
         cautious_wd = False,
         wd_towards_init = False,
-        delay_steps = 1,
-        enable_pilar = False,
-        pilar_mixing_param = 0.5,
         use_critic_ema = True,
         use_minto = False,
         use_delightful_pg = False,
         delightful_eta = 1.0
     ):
         super().__init__()
-        assert delay_steps > 0, 'delay steps must be greater than 0'
-
-        # delay buffer and pilar
-
-        self.delay_steps = delay_steps
-        self.delay_buffer = deque()
-
-        self.enable_pilar = enable_pilar
-        self.pilar_mixing_param = pilar_mixing_param
 
         # minto (use online network if you can)
 
@@ -438,17 +437,6 @@ class StreamingACLambda(Module):
             assert actor_embed.shape[-1] == dim_actor
             assert critic_embed.shape[-1] == dim_critic
 
-        # hl-gauss
-
-        self.hl_gauss_layer = HLGaussLayer(
-            dim = dim_critic,
-            hl_gauss_loss = dict(
-                min_value = val_min,
-                max_value = val_max,
-                num_bins = num_bins,
-            )
-        )
-
         # state and reward normalization
 
         self.state_norm = ObservationNormalizer(dim_state)
@@ -461,13 +449,51 @@ class StreamingACLambda(Module):
         self.actor_self_predict_repr = actor_self_predict_repr
         self.critic_self_predict_repr = critic_self_predict_repr
 
+        self.spr_lr = spr_lr
+        self.spr_orth_beta = spr_orth_beta
+
+        # actor
+
+        dim_readout_input = dim_actor
+
+        self.actor = actor
+
+        assert num_discrete_actions > 0 or num_continuous_actions > 0
+
+        self.readout = Readout(
+            dim_readout_input,
+            num_discrete = num_discrete_actions,
+            num_continuous = num_continuous_actions
+        )
+
+        self.actor_with_readout = Sequential(actor, self.readout)
+
+        self.actor_use_ema = actor_use_ema
+        actor_has_ema = actor_use_ema or (actor_self_predict_repr and spr_target_embed_from_ema)
+        self.actor_with_readout_ema = EMA(self.actor_with_readout, beta = actor_ema_beta) if actor_has_ema else None
+
+        # linear layer for critic
+
+        self.critic_readout = Sequential(
+            Linear(dim_critic, 1),
+            Rearrange('... 1 -> ...')
+        )
+
+        # critic
+
+        self.critic = critic
+
+        self.critic_full = Sequential(critic, self.critic_readout)
+
+        self.use_critic_ema = use_critic_ema
+        critic_has_ema = use_critic_ema or (critic_self_predict_repr and spr_target_embed_from_ema)
+        self.critic_ema = EMA(self.critic_full, beta = critic_ema_beta) if critic_has_ema else None
+
+        # self-predictive representations (Nilaksh et al. 2026)
+
         if actor_self_predict_repr:
-
-            if spr_target_embed_from_ema:
-                actor_use_ema |= True
-
             self.actor_spr = SelfPredictRepr(
-                dim_actor,
+                dim_readout_input,
                 num_discrete_actions = num_discrete_actions,
                 num_continuous_actions = num_continuous_actions,
                 target_embed_from_ema = spr_target_embed_from_ema,
@@ -476,10 +502,6 @@ class StreamingACLambda(Module):
             )
 
         if critic_self_predict_repr:
-
-            if spr_target_embed_from_ema:
-                use_critic_ema |= True
-
             self.critic_spr = SelfPredictRepr(
                 dim_critic,
                 num_discrete_actions = num_discrete_actions,
@@ -488,32 +510,6 @@ class StreamingACLambda(Module):
                 sigreg_weight = spr_sigreg_weight,
                 dim_hidden_expand_factor = spr_dim_hidden_expand_factor
             )
-
-        # actor
-
-        self.actor = actor
-
-        assert num_discrete_actions > 0 or num_continuous_actions > 0
-
-        self.readout = Readout(
-            dim_actor,
-            num_discrete = num_discrete_actions,
-            num_continuous = num_continuous_actions
-        )
-
-        self.actor_with_readout = Sequential(actor, self.readout)
-
-        self.actor_use_ema = actor_use_ema
-        self.actor_with_readout_ema = EMA(self.actor_with_readout, beta = actor_ema_beta) if actor_use_ema else None
-
-        # critic
-
-        self.critic = critic
-
-        self.critic_full = Sequential(critic, self.hl_gauss_layer)
-
-        self.use_critic_ema = use_critic_ema
-        self.critic_ema = EMA(self.critic_full, beta = critic_ema_beta) if self.use_critic_ema else None
 
         # td related
 
@@ -535,13 +531,20 @@ class StreamingACLambda(Module):
 
         if adaptive:
             self.register_buffer('step', tensor(0))
-            self.actor_m = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
-            self.critic_m = BufferDict({name: torch.zeros_like(param) for name, param in self.critic_full.named_parameters()})
-
             self.actor_v = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
             self.critic_v = BufferDict({name: torch.zeros_like(param) for name, param in self.critic_full.named_parameters()})
 
         self.eligibility_trace_decay = eligibility_trace_decay # lambda in paper
+
+        # spr gradient momentum for orth¹ decorrelation (Nilaksh et al. 2026)
+
+        if actor_self_predict_repr:
+            self.actor_spr_momentum = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
+            self.actor_spr_aux_momentum = BufferDict({str(i): torch.zeros_like(param) for i, param in enumerate(self.actor_spr.parameters())})
+
+        if critic_self_predict_repr:
+            self.critic_spr_momentum = BufferDict({name: torch.zeros_like(param) for name, param in self.critic_full.named_parameters()})
+            self.critic_spr_aux_momentum = BufferDict({str(i): torch.zeros_like(param) for i, param in enumerate(self.critic_spr.parameters())})
 
         # adaptive step related (obgd)
 
@@ -580,6 +583,16 @@ class StreamingACLambda(Module):
 
         # set actor and critic lambda if eligibility trace is used
 
+    def save(self, path, overwrite = True):
+        path = Path(path)
+        assert overwrite or not path.exists(), f"File {path} already exists"
+        torch.save(self.state_dict(), str(path))
+
+    def load(self, path):
+        path = Path(path)
+        assert path.exists(), f"File {path} does not exist"
+        self.load_state_dict(torch.load(str(path)))
+
     def init_(self, module):
         if not isinstance(module, Linear):
             return
@@ -596,17 +609,23 @@ class StreamingACLambda(Module):
         if self.adaptive:
             self.step.zero_()
 
-            for m in self.actor_m.values():
-                m.zero_()
-
-            for m in self.critic_m.values():
-                m.zero_()
-
             for v in self.actor_v.values():
                 v.zero_()
 
             for v in self.critic_v.values():
                 v.zero_()
+
+        if self.actor_self_predict_repr:
+            for m in self.actor_spr_momentum.values():
+                m.zero_()
+            for m in self.actor_spr_aux_momentum.values():
+                m.zero_()
+
+        if self.critic_self_predict_repr:
+            for m in self.critic_spr_momentum.values():
+                m.zero_()
+            for m in self.critic_spr_aux_momentum.values():
+                m.zero_()
 
     def update(
         self,
@@ -614,61 +633,26 @@ class StreamingACLambda(Module):
         action,
         next_state,
         reward,
-        is_terminal = False,
-        delay_steps = None,
-        drain = False
+        is_terminal = False
     ):
-        reward = cast_tensor(reward)
-        is_terminal = cast_tensor(is_terminal)
+        device = state.device
+        action = cast_tensor(action, device = device)
+        reward = cast_tensor(reward, dtype = torch.float32, device = device)
+        is_terminal = cast_tensor(is_terminal, dtype = torch.bool, device = device)
 
         state = self.state_norm(state, update = True)
         next_state = self.state_norm(next_state, update = False)
 
         normed_reward = self.reward_norm(reward, is_terminal = is_terminal, update = True)
 
-        self.delay_buffer.append((state, action, normed_reward, next_state, is_terminal))
-
-        # process all pending transitions in the buffer
-
-        delay_steps = default(delay_steps, self.delay_steps)
-
-        should_learn = len(self.delay_buffer) >= delay_steps or is_terminal.item() or drain
-
-        if not should_learn:
-            return UpdateMetrics(0., 0., 0., 0., 0., 0., 0., 0.)
-
-        # process all pending transitions in the buffer
-
-        metrics = None
-
-        while len(self.delay_buffer) > 0:
-            metrics = self._learn_step(list(self.delay_buffer))
-            self.delay_buffer.popleft()
-
-            if not is_terminal.item() and not drain:
-                break
+        metrics = self._learn_step((state, action, normed_reward, next_state, is_terminal))
 
         return metrics
 
-    def _learn_step(self, buffer_slice):
-        """single learning step for the oldest transition in buffer_slice, using n-step return"""
+    def _learn_step(self, transition):
+        """single learning step for a transition, using 1-step return"""
 
-        oldest_state, oldest_action, oldest_reward, oldest_next_state, oldest_is_term = buffer_slice[0]
-        last_next_state = buffer_slice[-1][3]
-
-        # n-step discounted return
-
-        n_step_return = 0.
-        discount = 1.0
-
-        for _, _, reward, _, is_term in buffer_slice:
-            n_step_return = n_step_return + discount * reward
-
-            if is_term.item():
-                discount = 0.
-                break
-
-            discount *= self.discount_factor
+        state, action, reward, next_state, is_term = transition
 
         # all gradient related
 
@@ -676,8 +660,7 @@ class StreamingACLambda(Module):
 
             # critic
 
-            embed = self.critic(oldest_state)
-            value_pred = self.hl_gauss_layer(embed)
+            value_pred = self.critic_full(state)
 
             # getting the bootstrapped value
 
@@ -687,53 +670,40 @@ class StreamingACLambda(Module):
                 if not self.use_minto:
                     return next_value
 
-                # Hendawy et al. https://openreview.net/forum?id=rFLuaG9Yq6
-
                 online_next_value = self.critic_full(state)
                 return torch.min(next_value, online_next_value)
 
-            # n-step td target
+            # 1-step td target
 
-            if discount > 0.:
-                td_target = (n_step_return + discount * get_next_value_pred(last_next_state)).detach()
+            if not is_term.item():
+                td_target = (reward + self.discount_factor * get_next_value_pred(next_state)).detach()
             else:
-                td_target = n_step_return.detach()
+                td_target = reward.detach()
 
-            # pilar - average of 1-step and n-step td targets
-            # https://arxiv.org/abs/2402.03903
+            # critic mse
 
-            if self.enable_pilar and len(buffer_slice) > 1:
-                if oldest_is_term.item():
-                    td_target_1 = oldest_reward.detach()
-                else:
-                    td_target_1 = (oldest_reward + self.discount_factor * get_next_value_pred(oldest_next_state)).detach()
-
-                td_target = torch.lerp(td_target_1, td_target, self.pilar_mixing_param)
-
-            value_loss = self.hl_gauss_layer(embed, td_target)
-
+            # The critic trace accumulates the gradient of the value prediction (scalar output).
+            # We differentiate +value_pred so that when added with delta, it moves the value towards target.
             critic_params = list(self.critic_full.parameters())
-            critic_loss_grads = torch.autograd.grad(value_loss, critic_params)
+            critic_trace_grads = torch.autograd.grad(value_pred, critic_params, retain_graph=True)
 
             td_error = td_target - value_pred
             td_error_sign = td_error.detach().sign()
 
-            # ObGD pseudo-gradient
-
-            safe_delta = torch.where(td_error.detach() >= 0, 1.0, -1.0) * td_error.detach().abs().clamp(min = 1e-6)
-
             value_grad = {
-                name: -grad / safe_delta
-                for (name, _), grad in zip(self.critic_full.named_parameters(), critic_loss_grads)
+                name: grad
+                for (name, _), grad in zip(self.critic_full.named_parameters(), critic_trace_grads)
             }
 
             # actor with entropy regularization
 
-            action_logits = self.actor_with_readout(oldest_state)
-            log_prob = self.readout.log_prob(action_logits, oldest_action).mean()
+            action_logits = self.actor_with_readout(state)
+            log_prob = self.readout.log_prob(action_logits, action).mean()
             entropy = self.readout.entropy(action_logits).mean()
 
-            actor_loss = log_prob
+            # Combine entropy into the actor trace, modulated by sign(td_error)
+
+            actor_loss = log_prob + self.entropy_weight * td_error_sign * entropy
 
             actor_params = list(self.actor_with_readout.parameters())
 
@@ -746,54 +716,85 @@ class StreamingACLambda(Module):
 
             actor_spr_grad = None
             if self.actor_self_predict_repr:
-                actor_embed = self.actor(oldest_state)
+                actor_embed = self.actor(state)
 
-                if self.actor_use_ema:
-                    actor_next_embed = self.actor_with_readout_ema.ema_model[0](last_next_state)
+                if self.actor_spr.target_embed_from_ema:
+                    assert exists(self.actor_with_readout_ema), 'actor ema must be available if target_embed_from_ema is True'
+                    actor_next_embed = first(self.actor_with_readout_ema.ema_model)(next_state)
                 else:
-                    actor_next_embed = self.actor(last_next_state)
+                    actor_next_embed = self.actor(next_state)
 
-                spr_loss = self.actor_spr(actor_embed, oldest_action, actor_next_embed)
+                spr_loss = self.actor_spr(actor_embed, action, actor_next_embed)
 
                 spr_params = list(self.actor_spr.parameters())
                 spr_grads_tup = torch.autograd.grad(spr_loss, actor_params + spr_params, retain_graph = True, allow_unused = True)
                 spr_grads_tup = tuple(default(g, torch.zeros_like(p)) for g, p in zip(spr_grads_tup, actor_params + spr_params))
 
                 actor_spr_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), spr_grads_tup[:len(actor_params)])}
-                spr_only_grad = spr_grads_tup[len(actor_params):]
+                spr_only_grad = list(spr_grads_tup[len(actor_params):])
 
-                # Update SPR networks via SGD
+                # orth¹: project SPR encoder grads orthogonal to their own EMA momentum
+                # this decorrelates the highly correlated streaming data
+
+                actor_names = list(actor_spr_grad.keys())
+                all_grads = [actor_spr_grad[n] for n in actor_names] + spr_only_grad
+                all_moms = [self.actor_spr_momentum[n] for n in actor_names] + list(self.actor_spr_aux_momentum.values())
+
+                all_grads_proj = [orthog_project(g, m) for g, m in zip(all_grads, all_moms)]
+
+                for grad, mom in zip(all_grads, all_moms):
+                    mom.mul_(self.spr_orth_beta).add_(grad, alpha = 1. - self.spr_orth_beta)
+
+                for name, proj_grad in zip(actor_names, all_grads_proj[:len(actor_names)]):
+                    actor_spr_grad[name] = proj_grad
+
+                spr_only_grad = all_grads_proj[len(actor_names):]
+
+                # Update SPR auxiliary networks via SGD with dedicated spr_lr
                 for param, grad in zip(spr_params, spr_only_grad):
-                    param.data.add_(grad, alpha = -self.actor_lr)
+                    param.data.add_(grad, alpha = -self.spr_lr)
 
             # critic SPR loss
 
             critic_spr_grad = None
             if self.critic_self_predict_repr:
-                critic_embed = self.critic(oldest_state)
+                critic_embed = self.critic(state)
 
-                if self.use_critic_ema:
-                    critic_next_embed = self.critic_ema.ema_model[0](last_next_state)
+                if self.critic_spr.target_embed_from_ema:
+                    assert exists(self.critic_ema), 'critic ema must be available if target_embed_from_ema is True'
+                    critic_next_embed = first(self.critic_ema.ema_model)(next_state)
                 else:
-                    critic_next_embed = self.critic(last_next_state)
+                    critic_next_embed = self.critic(next_state)
 
-                critic_spr_loss = self.critic_spr(critic_embed, oldest_action, critic_next_embed)
+                critic_spr_loss = self.critic_spr(critic_embed, action, critic_next_embed)
 
                 critic_spr_params = list(self.critic_spr.parameters())
                 critic_spr_grads_tup = torch.autograd.grad(critic_spr_loss, critic_params + critic_spr_params, retain_graph = True, allow_unused = True)
                 critic_spr_grads_tup = tuple(default(g, torch.zeros_like(p)) for g, p in zip(critic_spr_grads_tup, critic_params + critic_spr_params))
 
                 critic_spr_grad = {name: grad for (name, _), grad in zip(self.critic_full.named_parameters(), critic_spr_grads_tup[:len(critic_params)])}
-                critic_spr_only_grad = critic_spr_grads_tup[len(critic_params):]
+                critic_spr_only_grad = list(critic_spr_grads_tup[len(critic_params):])
 
-                # Update SPR networks via SGD
+                # project SPR encoder grads orthogonal to their own EMA momentum
+
+                critic_names = list(critic_spr_grad.keys())
+                all_grads = [critic_spr_grad[n] for n in critic_names] + critic_spr_only_grad
+                all_moms = [self.critic_spr_momentum[n] for n in critic_names] + list(self.critic_spr_aux_momentum.values())
+
+                all_grads_proj = [orthog_project(g, m) for g, m in zip(all_grads, all_moms)]
+
+                for grad, mom in zip(all_grads, all_moms):
+                    mom.mul_(self.spr_orth_beta).add_(grad, alpha = 1. - self.spr_orth_beta)
+
+                for name, proj_grad in zip(critic_names, all_grads_proj[:len(critic_names)]):
+                    critic_spr_grad[name] = proj_grad
+
+                critic_spr_only_grad = all_grads_proj[len(critic_names):]
+
+                # Update SPR auxiliary networks via SGD with dedicated spr_lr
+
                 for param, grad in zip(critic_spr_params, critic_spr_only_grad):
-                    param.data.add_(grad, alpha = -self.critic_lr)
-
-            # entropy gradient decoupled from td_error
-
-            entropy_grads_tup = torch.autograd.grad(entropy, actor_params, retain_graph = True)
-            entropy_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), entropy_grads_tup)}
+                    param.data.add_(grad, alpha = -self.spr_lr)
 
         td_error = td_error.detach().squeeze()
         td_error_sign = td_error_sign.detach().squeeze()
@@ -804,7 +805,7 @@ class StreamingACLambda(Module):
         gate = 1.
         if self.use_delightful_pg:
             surprisal = -log_prob.detach()
-            delight = td_error * surprisal
+            delight = td_error.detach() * surprisal
             gate = (delight / self.delightful_eta).sigmoid()
 
         # update eligibility traces
@@ -821,24 +822,21 @@ class StreamingACLambda(Module):
 
         td_error_factor = td_error.abs().clamp(min = 1.)
 
-        actor_grad_norm = torch.stack([g.norm(p=1) for g in actor_grad.values()]).mean()
-        critic_grad_norm = torch.stack([g.norm(p=1) for g in value_grad.values()]).mean()
+        actor_grad_norm = torch.stack([g.norm(p = 1) for g in actor_grad.values()]).mean()
+        critic_grad_norm = torch.stack([g.norm(p = 1) for g in value_grad.values()]).mean()
 
         if self.adaptive:
             self.step.add_(1)
             step = self.step.item()
-            bias_correction1 = 1. - self.adam_beta1 ** step
             bias_correction2 = 1. - self.adam_beta2 ** step
 
-        def update_params(params, init_params, traces, ms, vs, kappa, lr, l2_wd, has_l2_wd, l1_wd, has_l1_wd, has_any_wd, cautious_wd, wd_towards_init, aux_grads = None, spr_grads = None):
+        def update_params(params, init_params, traces, vs, kappa, lr, l2_wd, has_l2_wd, l1_wd, has_l1_wd, has_any_wd, cautious_wd, wd_towards_init, spr_grads = None):
             if self.adaptive:
-                # update first and second moments of semi-gradients
+                # update second moment of semi-gradients
 
                 for name, trace in traces.items():
-                    m, v = ms[name], vs[name]
+                    v = vs[name]
                     grad = td_error * trace
-
-                    m.lerp_(grad, 1. - self.adam_beta1)
                     v.mul_(self.adam_beta2).add_(grad ** 2, alpha = 1. - self.adam_beta2)
 
                 # adam update direction + obgd bound (Algorithm 11)
@@ -850,8 +848,7 @@ class StreamingACLambda(Module):
                     v_hat = vs[name] / bias_correction2
                     denom = v_hat.sqrt() + self.eps
 
-                    m_hat = ms[name] / bias_correction1
-                    adapted_grads[name] = m_hat / denom
+                    adapted_grads[name] = td_error * trace / denom
 
                     trace_sum += (trace / denom).abs().sum()
             else:
@@ -866,12 +863,9 @@ class StreamingACLambda(Module):
             for name, param in params.named_parameters():
                 update = adapted_grads[name] * global_scale * lr
 
-                if exists(aux_grads):
-                    update = update + aux_grads[name] * self.entropy_weight * global_scale * lr
-
                 if exists(spr_grads) and name in spr_grads:
                     spr_update = -spr_grads[name] * lr
-                    spr_update = orthogonal_project(spr_update, update)
+                    spr_update = orthog_project(spr_update, update)
                     update = update + spr_update
 
                 # add gradient update first
@@ -906,7 +900,6 @@ class StreamingACLambda(Module):
             self.actor_with_readout,
             self.init_params['actor'] if exists(self.init_params) else None,
             self.actor_trace,
-            self.actor_m if self.adaptive else None,
             self.actor_v if self.adaptive else None,
             self.actor_kappa,
             self.actor_lr,
@@ -917,15 +910,13 @@ class StreamingACLambda(Module):
             self.has_any_wd,
             self.cautious_wd,
             self.wd_towards_init,
-            entropy_grad,
-            actor_spr_grad
+            spr_grads = actor_spr_grad
         )
 
         critic_trace_norm, critic_scale = update_params(
             self.critic_full,
             self.init_params['critic'] if exists(self.init_params) else None,
             self.critic_trace,
-            self.critic_m if self.adaptive else None,
             self.critic_v if self.adaptive else None,
             self.critic_kappa,
             self.critic_lr,
@@ -936,8 +927,7 @@ class StreamingACLambda(Module):
             self.has_any_wd,
             self.cautious_wd,
             self.wd_towards_init,
-            None,
-            critic_spr_grad
+            spr_grads = critic_spr_grad
         )
 
         if self.actor_use_ema:

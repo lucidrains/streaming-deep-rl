@@ -6,7 +6,7 @@
 #   "gymnasium[box2d,other]",
 #   "fire",
 #   "tqdm",
-#   "x-mlps-pytorch>=0.0.8",
+#   "x-mlps-pytorch>=0.3.3",
 #   "einx",
 #   "rich",
 #   "wandb"
@@ -128,15 +128,12 @@ def main(
     render_every_eps = 250,
     cpu = True,
     adaptive = True,
-    val_min = -2.5,
-    val_max = 2.5,
-    num_bins = 127,
-    delay_steps = 7,
+    spr = False,
+    spr_target_embed_from_ema = False,
+    spr_sigreg_weight = 0.1,
     init_sparsity = 0.9,
     dim_actor = 128,
     dim_critic = 128,
-    enable_pilar = False,
-    pilar_mixing_param = 0.5,
     l2_weight_decay = 0.,
     l1_weight_decay = 0.,
     cautious_wd = False,
@@ -144,7 +141,8 @@ def main(
     use_critic_ema = True,
     use_minto = False,
     use_delightful_pg = False,
-    delightful_eta = 1.0
+    delightful_eta = 1.0,
+    depth = 3
 ):
     if render:
         rmtree(VIDEO_FOLDER, ignore_errors = True)
@@ -199,15 +197,15 @@ def main(
     actor = ResidualNormedMLP(
         dim_actor,
         dim_in = dim_state,
-        depth = 4,
-        residual_every = 1
+        depth = depth,
+        residual_every = 1,
     ).to(device)
 
     critic = ResidualNormedMLP(
         dim_critic,
         dim_in = dim_state,
-        depth = 4,
-        residual_every = 1
+        depth = depth,
+        residual_every = 1,
     ).to(device)
 
     agent = StreamingACLambda(
@@ -223,11 +221,11 @@ def main(
         discount_factor = discount_factor,
         eligibility_trace_decay = eligibility_trace_decay,
         dim_critic = dim_critic,
-        val_min = val_min,
-        val_max = val_max,
-        num_bins = num_bins,
         init_sparsity = init_sparsity,
-        delay_steps = delay_steps,
+        actor_self_predict_repr = spr,
+        critic_self_predict_repr = spr,
+        spr_target_embed_from_ema = spr_target_embed_from_ema,
+        spr_sigreg_weight = spr_sigreg_weight,
         l2_weight_decay = l2_weight_decay,
         l1_weight_decay = l1_weight_decay,
         cautious_wd = cautious_wd,
@@ -250,10 +248,9 @@ def main(
         discount_factor = discount_factor,
         eligibility_trace_decay = eligibility_trace_decay,
         adaptive = adaptive,
-        delay_steps = delay_steps,
         init_sparsity = init_sparsity,
-        enable_pilar = enable_pilar,
-        pilar_mixing_param = pilar_mixing_param,
+        spr_target_embed_from_ema = spr_target_embed_from_ema,
+        spr_sigreg_weight = spr_sigreg_weight,
         l2_weight_decay = l2_weight_decay,
         l1_weight_decay = l1_weight_decay,
         cautious_wd = cautious_wd,
@@ -289,8 +286,6 @@ def main(
 
                 next_state_np, reward, terminated, truncated, _ = env.step(int(action.item()))
 
-                reward_t = tensor(reward, dtype = torch.float32, device = device)
-                is_terminal = tensor(terminated, dtype = torch.bool, device = device)
                 next_state = torch.from_numpy(next_state_np).float().to(device)
 
                 # update
@@ -299,9 +294,8 @@ def main(
                     state = state,
                     action = action,
                     next_state = next_state,
-                    reward = reward_t,
-                    is_terminal = is_terminal,
-                    drain = terminated or truncated
+                    reward = reward,
+                    is_terminal = terminated
                 )
 
                 dashboard.update_diagnostics(

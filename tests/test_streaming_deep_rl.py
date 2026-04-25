@@ -1,10 +1,7 @@
-from functools import partial
-
 import pytest
 param = pytest.mark.parametrize
 
 import torch
-from torch.nn import LayerNorm
 
 @param('actor_self_predict_repr', (False, True))
 @param('critic_self_predict_repr', (False, True))
@@ -50,3 +47,8 @@ def test_streaming(
 
     actions = streaming_actor_critic.sample_action(action_dist_params)
     streaming_actor_critic.update(state, actions, state, 1.)
+
+    # test save and load
+
+    streaming_actor_critic.save('./test_streaming_ckpt.pt')
+    streaming_actor_critic.load('./test_streaming_ckpt.pt')
