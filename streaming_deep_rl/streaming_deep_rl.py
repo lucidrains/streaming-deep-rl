@@ -1,9 +1,7 @@
 from __future__ import annotations
 import math
 from pathlib import Path
-from collections import deque
-from contextlib import nullcontext
-from typing import Callable, NamedTuple
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -456,7 +454,11 @@ class StreamingACLambda(Module):
         use_critic_ema = True,
         use_minto = False,
         use_delightful_pg = False,
-        delightful_eta = 1.0
+        delightful_eta = 1.0,
+        use_hl_gauss = True,
+        hl_gauss_val_min = -3.,
+        hl_gauss_val_max = 3.,
+        hl_gauss_num_bins = 64
     ):
         super().__init__()
 
@@ -517,12 +519,25 @@ class StreamingACLambda(Module):
         actor_has_ema = actor_use_ema or (actor_self_predict_repr and spr_target_embed_from_ema)
         self.actor_with_readout_ema = EMA(self.actor_with_readout, beta = actor_ema_beta) if actor_has_ema else None
 
-        # linear layer for critic
+        # critic readout
 
-        self.critic_readout = Sequential(
-            Linear(dim_critic, 1),
-            Rearrange('... 1 -> ...')
-        )
+        self.use_hl_gauss = use_hl_gauss
+
+        if use_hl_gauss:
+            self.hl_gauss_layer = HLGaussLayer(
+                dim = dim_critic,
+                hl_gauss_loss = dict(
+                    min_value = hl_gauss_val_min,
+                    max_value = hl_gauss_val_max,
+                    num_bins = hl_gauss_num_bins,
+                )
+            )
+            self.critic_readout = self.hl_gauss_layer
+        else:
+            self.critic_readout = Sequential(
+                Linear(dim_critic, 1),
+                Rearrange('... 1 -> ...')
+            )
 
         # critic
 
@@ -702,7 +717,8 @@ class StreamingACLambda(Module):
 
             # critic
 
-            value_pred = self.critic_full(state)
+            critic_embed = self.critic(state)
+            value_pred = self.critic_readout(critic_embed)
 
             # getting the bootstrapped value
 
@@ -724,13 +740,19 @@ class StreamingACLambda(Module):
 
             # critic mse
 
-            # The critic trace accumulates the gradient of the value prediction (scalar output).
-            # We differentiate +value_pred so that when added with delta, it moves the value towards target.
-            critic_params = list(self.critic_full.parameters())
-            critic_trace_grads = torch.autograd.grad(value_pred, critic_params, retain_graph=True)
-
             td_error = td_target - value_pred
             td_error_sign = td_error.detach().sign()
+
+            critic_params = list(self.critic_full.parameters())
+
+            if self.use_hl_gauss:
+                value_loss = self.hl_gauss_layer(critic_embed, td_target)
+                critic_trace_grads = torch.autograd.grad(value_loss, critic_params, retain_graph=True, allow_unused=True)
+
+                safe_delta = torch.where(td_error.detach() >= 0, 1.0, -1.0) * td_error.detach().abs().clamp(min = 1e-6)
+                critic_trace_grads = [(-grad / safe_delta) if exists(grad) else None for grad in critic_trace_grads]
+            else:
+                critic_trace_grads = torch.autograd.grad(value_pred, critic_params, retain_graph=True, allow_unused=True)
 
             value_grad = {
                 name: grad
@@ -754,89 +776,95 @@ class StreamingACLambda(Module):
             actor_loss_grads = torch.autograd.grad(actor_loss, actor_params, retain_graph = True)
             actor_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), actor_loss_grads)}
 
+            # SPR gradient helper
+
+            def get_spr_grad(
+                embed,
+                network,
+                network_with_readout,
+                network_ema,
+                spr_module,
+                spr_momentum,
+                spr_aux_momentum,
+                network_params
+            ):
+                # target representation
+
+                if spr_module.target_embed_from_ema:
+                    assert exists(network_ema), 'ema must be available if target_embed_from_ema is True'
+                    next_embed = first(network_ema.ema_model)(next_state)
+                else:
+                    next_embed = network(next_state)
+
+                # loss
+
+                spr_loss = spr_module(embed, action, next_embed)
+
+                # gradients
+
+                spr_params = list(spr_module.parameters())
+                spr_grads_tup = torch.autograd.grad(spr_loss, network_params + spr_params, retain_graph = True, allow_unused = True)
+                spr_grads_tup = tuple(default(g, torch.zeros_like(p)) for g, p in zip(spr_grads_tup, network_params + spr_params))
+
+                spr_grad = {name: grad for (name, _), grad in zip(network_with_readout.named_parameters(), spr_grads_tup[:len(network_params)])}
+                spr_only_grad = list(spr_grads_tup[len(network_params):])
+
+                # orth¹: project SPR encoder grads orthogonal to their own EMA momentum
+                # this decorrelates the highly correlated streaming data
+
+                names = list(spr_grad.keys())
+                all_grads = [spr_grad[n] for n in names] + spr_only_grad
+                all_moms = [spr_momentum[n] for n in names] + list(spr_aux_momentum.values())
+
+                all_grads_proj = [orthog_project(g, m) for g, m in zip(all_grads, all_moms)]
+
+                # momentum update
+
+                for grad, mom in zip(all_grads, all_moms):
+                    mom.mul_(self.spr_orth_beta).add_(grad, alpha = 1. - self.spr_orth_beta)
+
+                for name, proj_grad in zip(names, all_grads_proj[:len(names)]):
+                    spr_grad[name] = proj_grad
+
+                spr_only_grad = all_grads_proj[len(names):]
+
+                # update SPR auxiliary networks via SGD with dedicated spr_lr
+
+                for param, grad in zip(spr_params, spr_only_grad):
+                    param.data.add_(grad, alpha = -self.spr_lr)
+
+                return spr_grad
+
             # get the SPR loss
 
             actor_spr_grad = None
             if self.actor_self_predict_repr:
                 actor_embed = self.actor(state)
-
-                if self.actor_spr.target_embed_from_ema:
-                    assert exists(self.actor_with_readout_ema), 'actor ema must be available if target_embed_from_ema is True'
-                    actor_next_embed = first(self.actor_with_readout_ema.ema_model)(next_state)
-                else:
-                    actor_next_embed = self.actor(next_state)
-
-                spr_loss = self.actor_spr(actor_embed, action, actor_next_embed)
-
-                spr_params = list(self.actor_spr.parameters())
-                spr_grads_tup = torch.autograd.grad(spr_loss, actor_params + spr_params, retain_graph = True, allow_unused = True)
-                spr_grads_tup = tuple(default(g, torch.zeros_like(p)) for g, p in zip(spr_grads_tup, actor_params + spr_params))
-
-                actor_spr_grad = {name: grad for (name, _), grad in zip(self.actor_with_readout.named_parameters(), spr_grads_tup[:len(actor_params)])}
-                spr_only_grad = list(spr_grads_tup[len(actor_params):])
-
-                # orth¹: project SPR encoder grads orthogonal to their own EMA momentum
-                # this decorrelates the highly correlated streaming data
-
-                actor_names = list(actor_spr_grad.keys())
-                all_grads = [actor_spr_grad[n] for n in actor_names] + spr_only_grad
-                all_moms = [self.actor_spr_momentum[n] for n in actor_names] + list(self.actor_spr_aux_momentum.values())
-
-                all_grads_proj = [orthog_project(g, m) for g, m in zip(all_grads, all_moms)]
-
-                for grad, mom in zip(all_grads, all_moms):
-                    mom.mul_(self.spr_orth_beta).add_(grad, alpha = 1. - self.spr_orth_beta)
-
-                for name, proj_grad in zip(actor_names, all_grads_proj[:len(actor_names)]):
-                    actor_spr_grad[name] = proj_grad
-
-                spr_only_grad = all_grads_proj[len(actor_names):]
-
-                # Update SPR auxiliary networks via SGD with dedicated spr_lr
-                for param, grad in zip(spr_params, spr_only_grad):
-                    param.data.add_(grad, alpha = -self.spr_lr)
+                actor_spr_grad = get_spr_grad(
+                    actor_embed,
+                    self.actor,
+                    self.actor_with_readout,
+                    self.actor_with_readout_ema,
+                    self.actor_spr,
+                    self.actor_spr_momentum,
+                    self.actor_spr_aux_momentum,
+                    actor_params
+                )
 
             # critic SPR loss
 
             critic_spr_grad = None
             if self.critic_self_predict_repr:
-                critic_embed = self.critic(state)
-
-                if self.critic_spr.target_embed_from_ema:
-                    assert exists(self.critic_ema), 'critic ema must be available if target_embed_from_ema is True'
-                    critic_next_embed = first(self.critic_ema.ema_model)(next_state)
-                else:
-                    critic_next_embed = self.critic(next_state)
-
-                critic_spr_loss = self.critic_spr(critic_embed, action, critic_next_embed)
-
-                critic_spr_params = list(self.critic_spr.parameters())
-                critic_spr_grads_tup = torch.autograd.grad(critic_spr_loss, critic_params + critic_spr_params, retain_graph = True, allow_unused = True)
-                critic_spr_grads_tup = tuple(default(g, torch.zeros_like(p)) for g, p in zip(critic_spr_grads_tup, critic_params + critic_spr_params))
-
-                critic_spr_grad = {name: grad for (name, _), grad in zip(self.critic_full.named_parameters(), critic_spr_grads_tup[:len(critic_params)])}
-                critic_spr_only_grad = list(critic_spr_grads_tup[len(critic_params):])
-
-                # project SPR encoder grads orthogonal to their own EMA momentum
-
-                critic_names = list(critic_spr_grad.keys())
-                all_grads = [critic_spr_grad[n] for n in critic_names] + critic_spr_only_grad
-                all_moms = [self.critic_spr_momentum[n] for n in critic_names] + list(self.critic_spr_aux_momentum.values())
-
-                all_grads_proj = [orthog_project(g, m) for g, m in zip(all_grads, all_moms)]
-
-                for grad, mom in zip(all_grads, all_moms):
-                    mom.mul_(self.spr_orth_beta).add_(grad, alpha = 1. - self.spr_orth_beta)
-
-                for name, proj_grad in zip(critic_names, all_grads_proj[:len(critic_names)]):
-                    critic_spr_grad[name] = proj_grad
-
-                critic_spr_only_grad = all_grads_proj[len(critic_names):]
-
-                # Update SPR auxiliary networks via SGD with dedicated spr_lr
-
-                for param, grad in zip(critic_spr_params, critic_spr_only_grad):
-                    param.data.add_(grad, alpha = -self.spr_lr)
+                critic_spr_grad = get_spr_grad(
+                    critic_embed,
+                    self.critic,
+                    self.critic_full,
+                    self.critic_ema,
+                    self.critic_spr,
+                    self.critic_spr_momentum,
+                    self.critic_spr_aux_momentum,
+                    critic_params
+                )
 
         td_error = td_error.detach().squeeze()
         td_error_sign = td_error_sign.detach().squeeze()
