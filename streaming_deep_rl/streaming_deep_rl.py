@@ -401,7 +401,8 @@ class StreamingACLambda(Module):
         spr_target_embed_from_ema = True,
         spr_sigreg_weight = 0.,
         spr_dim_hidden_expand_factor = 4,
-        spr_lr = 1e-3,
+        spr_lr = 5e-2,
+        spr_lr_param_update = 1.,
         spr_orth_beta = 0.9,
         entropy_weight = 0.01,
         init_sparsity = 0.9,
@@ -450,6 +451,8 @@ class StreamingACLambda(Module):
         self.critic_self_predict_repr = critic_self_predict_repr
 
         self.spr_lr = spr_lr
+        self.spr_lr_param_update = spr_lr_param_update
+
         self.spr_orth_beta = spr_orth_beta
 
         # actor
@@ -861,12 +864,13 @@ class StreamingACLambda(Module):
             global_scale = (kappa * td_error_factor * trace_sum).reciprocal().clamp(max = 1.)
 
             for name, param in params.named_parameters():
-                update = adapted_grads[name] * global_scale * lr
+                update = adapted_grads[name] * lr
 
                 if exists(spr_grads) and name in spr_grads:
-                    spr_update = -spr_grads[name] * lr
-                    spr_update = orthog_project(spr_update, update)
-                    update = update + spr_update
+                    spr_update = -spr_grads[name] * self.spr_lr_param_update
+                    update = update + orthog_project(spr_update, update)
+
+                update = update * global_scale
 
                 # add gradient update first
 
