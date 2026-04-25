@@ -455,7 +455,7 @@ class StreamingACLambda(Module):
         use_minto = False,
         use_delightful_pg = False,
         delightful_eta = 1.0,
-        use_hl_gauss = True,
+        use_hl_gauss = False,
         hl_gauss_val_min = -3.,
         hl_gauss_val_max = 3.,
         hl_gauss_num_bins = 64
