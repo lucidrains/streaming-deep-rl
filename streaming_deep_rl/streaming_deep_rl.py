@@ -191,7 +191,8 @@ class SelfPredictRepr(Module):
         self,
         state_embed,
         actions,
-        next_state_embed
+        next_state_embed,
+        ema_to_projection = None
     ):
         projected = self.to_projection(state_embed)
 
@@ -199,7 +200,11 @@ class SelfPredictRepr(Module):
 
         decorator = no_grad_detach if self.target_embed_from_ema else identity
 
-        next_projected = decorator(self.to_projection)(next_state_embed)
+        target_to_projection = self.to_projection
+        if self.target_embed_from_ema and exists(ema_to_projection):
+            target_to_projection = ema_to_projection
+
+        next_projected = decorator(target_to_projection)(next_state_embed)
 
         if self.use_sem:
             projected = self.sem(projected)
@@ -564,9 +569,11 @@ class StreamingACLambda(Module):
 
         if actor_self_predict_repr:
             self.actor_spr = SelfPredictRepr(dim_readout_input, **spr_kwargs)
+            self.actor_spr_ema = EMA(self.actor_spr.to_projection, beta = actor_ema_beta) if spr_target_embed_from_ema else None
 
         if critic_self_predict_repr:
             self.critic_spr = SelfPredictRepr(dim_critic, **spr_kwargs)
+            self.critic_spr_ema = EMA(self.critic_spr.to_projection, beta = critic_ema_beta) if spr_target_embed_from_ema else None
 
         # td related
 
@@ -787,7 +794,8 @@ class StreamingACLambda(Module):
                 spr_module,
                 spr_momentum,
                 spr_aux_momentum,
-                network_params
+                network_params,
+                ema_to_projection = None
             ):
                 # target representation
 
@@ -799,7 +807,7 @@ class StreamingACLambda(Module):
 
                 # loss
 
-                spr_loss = spr_module(embed, action, next_embed)
+                spr_loss = spr_module(embed, action, next_embed, ema_to_projection = ema_to_projection)
 
                 # gradients
 
@@ -849,7 +857,8 @@ class StreamingACLambda(Module):
                     self.actor_spr,
                     self.actor_spr_momentum,
                     self.actor_spr_aux_momentum,
-                    actor_params
+                    actor_params,
+                    ema_to_projection = self.actor_spr_ema
                 )
 
             # critic SPR loss
@@ -864,7 +873,8 @@ class StreamingACLambda(Module):
                     self.critic_spr,
                     self.critic_spr_momentum,
                     self.critic_spr_aux_momentum,
-                    critic_params
+                    critic_params,
+                    ema_to_projection = self.critic_spr_ema
                 )
 
         td_error = td_error.detach().squeeze()
@@ -1007,6 +1017,12 @@ class StreamingACLambda(Module):
 
         if self.use_critic_ema:
             self.critic_ema.update()
+
+        if self.actor_self_predict_repr and exists(self.actor_spr_ema):
+            self.actor_spr_ema.update()
+
+        if self.critic_self_predict_repr and exists(self.critic_spr_ema):
+            self.critic_spr_ema.update()
 
         return UpdateMetrics(
             td_error = td_error.item(),
