@@ -127,7 +127,7 @@ def main(
     adaptive = True,
     lapo = False,
     spr = False,
-    spr_use_sem = False,
+    spr_use_sem = True,
     spr_target_embed_from_ema = False,
     spr_sigreg_weight = 0.1,
     spr_dim_hidden_expand_factor = 4,

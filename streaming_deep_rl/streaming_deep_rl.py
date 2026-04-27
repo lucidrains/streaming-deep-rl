@@ -127,12 +127,19 @@ class SEM(Module):
     def __init__(
         self,
         dim,
+        dim_in = None,
+        project_in = None,
         temperature = 0.1,
         dim_simplex = 8,
         pre_layernorm = False
     ):
         super().__init__()
         assert divisible_by(dim, dim_simplex), f'{dim} must be divisible by {dim_simplex}'
+
+        dim_in = default(dim_in, dim)
+        project_in = default(project_in, dim_in != dim)
+
+        self.embedder = Linear(dim_in, dim, bias = False) if project_in else nn.Identity()
 
         self.dim = dim
         self.dim_simplex = dim_simplex
@@ -144,6 +151,7 @@ class SEM(Module):
         self,
         t
     ):
+        t = self.embedder(t)
         t = self.norm(t)
         t = rearrange(t, '... (l v) -> ... l v', v = self.dim_simplex)
         t = (t / self.temperature).softmax(dim = -1)
@@ -161,7 +169,7 @@ class SelfPredictRepr(Module):
         target_embed_from_ema = True, # whether the target embed is from an EMA, or from the model itself (traditional vs sigreg from lejepa)
         sigreg_weight = 0.,
         dim_hidden_expand_factor = 4,
-        use_sem = False,
+        use_sem = True,
         sem_dim_simplex = 8,
         sem_temperature = 0.1
     ):
@@ -171,22 +179,26 @@ class SelfPredictRepr(Module):
         dim_predict = default(dim_predict, dim_embed)
         dim_mlp_hidden = int(dim_embed * dim_hidden_expand_factor)
 
-        self.to_action_embed = Embed(dim_embed, num_discrete = num_discrete_actions, num_continuous = num_continuous_actions)
+        # when SEM is active, projects dim_embed -> dim_predict before the projector
+
+        dim_projector_in = dim_predict if use_sem else dim_embed
+
+        self.to_action_embed = Embed(dim_projector_in, num_discrete = num_discrete_actions, num_continuous = num_continuous_actions)
 
         self.target_embed_from_ema = target_embed_from_ema
 
         self.to_projection = nn.Sequential(
-            nn.RMSNorm(dim_embed),
-            MLP(dim_embed, dim_mlp_hidden, dim_predict)
+            nn.RMSNorm(dim_projector_in),
+            MLP(dim_projector_in, dim_mlp_hidden, dim_predict)
         )
 
-        self.to_prediction = MLP(dim_predict + dim_embed, dim_mlp_hidden, dim_predict)
+        self.to_prediction = MLP(dim_predict + dim_projector_in, dim_mlp_hidden, dim_predict)
 
         self.apply_sigreg = sigreg_weight > 0.
         self.sigreg_weight = sigreg_weight
 
         self.use_sem = use_sem
-        self.sem = SEM(dim_predict, temperature = sem_temperature, dim_simplex = sem_dim_simplex) if use_sem else nn.Identity()
+        self.sem = SEM(dim_predict, dim_in = dim_embed, project_in = True, temperature = sem_temperature, dim_simplex = sem_dim_simplex) if use_sem else nn.Identity()
 
     def forward(
         self,
@@ -195,6 +207,10 @@ class SelfPredictRepr(Module):
         next_state_embed,
         ema_to_projection = None
     ):
+        if self.use_sem:
+            state_embed = self.sem(state_embed)
+            next_state_embed = self.sem(next_state_embed)
+
         projected = self.to_projection(state_embed)
 
         # maybe no
@@ -206,10 +222,6 @@ class SelfPredictRepr(Module):
             target_to_projection = ema_to_projection
 
         next_projected = decorator(target_to_projection)(next_state_embed)
-
-        if self.use_sem:
-            projected = self.sem(projected)
-            next_projected = self.sem(next_projected)
 
         action_embed = self.to_action_embed(actions)
 
