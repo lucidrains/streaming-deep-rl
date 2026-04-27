@@ -1,7 +1,7 @@
 from __future__ import annotations
 import math
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Literal
 
 import torch
 import torch.nn.functional as F
@@ -149,6 +149,7 @@ class SEM(Module):
         t = (t / self.temperature).softmax(dim = -1)
         return rearrange(t, '... l v -> ... (l v)')
 
+# Max Schwarzer et al. https://arxiv.org/abs/2007.05929
 
 class SelfPredictRepr(Module):
     def __init__(
@@ -221,11 +222,102 @@ class SelfPredictRepr(Module):
         if not self.apply_sigreg:
             return loss
 
-        return loss + self.sigreg_weight * sigreg_loss(projected)
+        return loss + self.sigreg_weight * sigreg(projected)
+
+# Dominik Schmidt https://arxiv.org/abs/2312.10812
+
+class LAPO(Module):
+    def __init__(
+        self,
+        dim_embed,
+        dim_latent_action,
+        dim_project = None,
+        num_discrete_actions = 0,
+        num_continuous_actions = 0,
+        target_embed_from_ema = True,
+        sem_dim_simplex = 4,
+        sem_temperature = 0.1,
+        expansion_factor = 4,
+        pred_action_loss_weight = 0.,
+    ):
+        super().__init__()
+        assert num_discrete_actions > 0 or num_continuous_actions > 0
+
+        self.target_embed_from_ema = target_embed_from_ema
+
+        # dimensions
+
+        dim_project = default(dim_project, dim_embed)
+        dim_mlp_hidden = int(dim_embed * expansion_factor)
+
+        self.to_projection = nn.Sequential(
+            nn.RMSNorm(dim_embed),
+            MLP(dim_embed, dim_mlp_hidden, dim_project, activation = nn.SiLU())
+        )
+
+        # state + next state projected embeddings -> latent action - IDM
+
+        self.to_latent_action_embed = nn.Linear(dim_project * 2, dim_latent_action, bias = False)
+
+        # will use simplicial embed for action bottleneck
+
+        assert divisible_by(dim_latent_action, sem_dim_simplex)
+        self.sem = SEM(dim_latent_action, temperature = sem_temperature, dim_simplex = sem_dim_simplex)
+
+        # for action prediction loss
+
+        self.has_pred_action_loss = pred_action_loss_weight > 0.
+        self.pred_action_loss_weight = pred_action_loss_weight
+        self.action_readout = Readout(dim_latent_action, num_discrete = num_discrete_actions, num_continuous = num_continuous_actions) if self.has_pred_action_loss else None
+
+        # predicting the next state embed
+
+        self.to_pred_next_state_embed = MLP(dim_project + dim_latent_action, dim_mlp_hidden, dim_project, activation = nn.SiLU())
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
+
+    def forward(
+        self,
+        state_embed,
+        actions,
+        next_state_embed,
+        ema_to_projection = None
+    ):
+        state_projected = self.to_projection(state_embed)
+
+        next_state_transform_decorator = no_grad_detach if self.target_embed_from_ema else identity
+        next_state_projector = default(ema_to_projection, self.to_projection)
+        next_state_projected = next_state_transform_decorator(next_state_projector)(next_state_embed)
+
+        # inverse dynamics model
+
+        latent_action_embed = self.to_latent_action_embed(cat((state_projected, next_state_projected), dim = -1))
+
+        simplicial_embedded_latent_action = self.sem(latent_action_embed)
+
+        # maybe action loss
+
+        pred_action_loss = self.zero
+
+        if self.has_pred_action_loss:
+            pred_action_loss = self.action_readout(simplicial_embedded_latent_action, targets = actions, return_loss = True)
+            pred_action_loss = pred_action_loss * self.pred_action_loss_weight
+
+        # now do the forward dynamics model
+
+        pred_next_state_projected = self.to_pred_next_state_embed(cat((state_projected, simplicial_embedded_latent_action), dim = -1))
+
+        # cosine sim loss
+
+        recon_loss = F.mse_loss(l2norm(pred_next_state_projected), l2norm(next_state_projected).detach())
+
+        # lapo actually does a decoder back to state in pixel space, although probably not crucial given SPR
+
+        return recon_loss + pred_action_loss
 
 # sigreg from lejepa
 
-def sigreg_loss(
+def sigreg(
     x,
     num_slices = 1024,
     domain = (-5, 5),
@@ -438,14 +530,9 @@ class StreamingACLambda(Module):
         actor_use_ema = False,
         actor_ema_beta = 0.7,
         critic_ema_beta = 0.7,
-        actor_self_predict_repr = False,
-        critic_self_predict_repr = False,
-        spr_target_embed_from_ema = True,
-        spr_sigreg_weight = 0.,
-        spr_dim_hidden_expand_factor = 4,
-        spr_use_sem = False,
-        spr_sem_dim_simplex = 8,
-        spr_sem_temperature = 0.1,
+        ssl_type: Literal['spr', 'lapo'] | None = None,
+        spr_kwargs: dict = dict(),
+        lapo_kwargs: dict = dict(),
         spr_lr = 5e-2,
         spr_lr_param_update = 1.,
         spr_orth_beta = 0.9,
@@ -496,8 +583,8 @@ class StreamingACLambda(Module):
         # self-predictive representation
         # Schwarzer et al. https://arxiv.org/abs/2007.05929
 
-        self.actor_self_predict_repr = actor_self_predict_repr
-        self.critic_self_predict_repr = critic_self_predict_repr
+        assert ssl_type in (None, 'spr', 'lapo'), 'ssl_type must be either "spr", "lapo", or None'
+        self.ssl_type = ssl_type
 
         self.spr_lr = spr_lr
         self.spr_lr_param_update = spr_lr_param_update
@@ -520,9 +607,23 @@ class StreamingACLambda(Module):
 
         self.actor_with_readout = Sequential(actor, self.readout)
 
+        # squeezing more from stream - Nilaksh et al. https://arxiv.org/abs/2602.09396
+        # application of self predictive representation
+
+        ssl_action_kwargs = dict(num_discrete_actions = num_discrete_actions, num_continuous_actions = num_continuous_actions)
+
+        ssl_modules = dict(
+            spr = lambda dim: SelfPredictRepr(dim, **ssl_action_kwargs, **spr_kwargs),
+            lapo = lambda dim: LAPO(dim, dim_latent_action = dim, **ssl_action_kwargs, **lapo_kwargs)
+        )
+
+        self.actor_spr = ssl_modules[ssl_type](dim_readout_input) if exists(ssl_type) else None
+        self.critic_spr = ssl_modules[ssl_type](dim_critic) if exists(ssl_type) else None
+
         self.actor_use_ema = actor_use_ema
-        actor_has_ema = actor_use_ema or (actor_self_predict_repr and spr_target_embed_from_ema)
+        actor_has_ema = actor_use_ema or (exists(self.actor_spr) and self.actor_spr.target_embed_from_ema)
         self.actor_with_readout_ema = EMA(self.actor_with_readout, beta = actor_ema_beta) if actor_has_ema else None
+        self.actor_spr_ema = EMA(self.actor_spr.to_projection, beta = actor_ema_beta) if exists(self.actor_spr) and self.actor_spr.target_embed_from_ema else None
 
         # critic readout
 
@@ -551,29 +652,9 @@ class StreamingACLambda(Module):
         self.critic_full = Sequential(critic, self.critic_readout)
 
         self.use_critic_ema = use_critic_ema
-        critic_has_ema = use_critic_ema or (critic_self_predict_repr and spr_target_embed_from_ema)
+        critic_has_ema = use_critic_ema or (exists(self.critic_spr) and self.critic_spr.target_embed_from_ema)
         self.critic_ema = EMA(self.critic_full, beta = critic_ema_beta) if critic_has_ema else None
-
-        # self-predictive representations (Nilaksh et al. 2026)
-
-        spr_kwargs = dict(
-            num_discrete_actions = num_discrete_actions,
-            num_continuous_actions = num_continuous_actions,
-            target_embed_from_ema = spr_target_embed_from_ema,
-            sigreg_weight = spr_sigreg_weight,
-            dim_hidden_expand_factor = spr_dim_hidden_expand_factor,
-            use_sem = spr_use_sem,
-            sem_dim_simplex = spr_sem_dim_simplex,
-            sem_temperature = spr_sem_temperature
-        )
-
-        if actor_self_predict_repr:
-            self.actor_spr = SelfPredictRepr(dim_readout_input, **spr_kwargs)
-            self.actor_spr_ema = EMA(self.actor_spr.to_projection, beta = actor_ema_beta) if spr_target_embed_from_ema else None
-
-        if critic_self_predict_repr:
-            self.critic_spr = SelfPredictRepr(dim_critic, **spr_kwargs)
-            self.critic_spr_ema = EMA(self.critic_spr.to_projection, beta = critic_ema_beta) if spr_target_embed_from_ema else None
+        self.critic_spr_ema = EMA(self.critic_spr.to_projection, beta = critic_ema_beta) if exists(self.critic_spr) and self.critic_spr.target_embed_from_ema else None
 
         # td related
 
@@ -602,11 +683,9 @@ class StreamingACLambda(Module):
 
         # spr gradient momentum for orth¹ decorrelation (Nilaksh et al. 2026)
 
-        if actor_self_predict_repr:
+        if exists(self.ssl_type):
             self.actor_spr_momentum = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
             self.actor_spr_aux_momentum = BufferDict({str(i): torch.zeros_like(param) for i, param in enumerate(self.actor_spr.parameters())})
-
-        if critic_self_predict_repr:
             self.critic_spr_momentum = BufferDict({name: torch.zeros_like(param) for name, param in self.critic_full.named_parameters()})
             self.critic_spr_aux_momentum = BufferDict({str(i): torch.zeros_like(param) for i, param in enumerate(self.critic_spr.parameters())})
 
@@ -678,13 +757,11 @@ class StreamingACLambda(Module):
             for v in self.critic_v.values():
                 v.zero_()
 
-        if self.actor_self_predict_repr:
+        if exists(self.ssl_type):
             for m in self.actor_spr_momentum.values():
                 m.zero_()
             for m in self.actor_spr_aux_momentum.values():
                 m.zero_()
-
-        if self.critic_self_predict_repr:
             for m in self.critic_spr_momentum.values():
                 m.zero_()
             for m in self.critic_spr_aux_momentum.values():
@@ -847,7 +924,7 @@ class StreamingACLambda(Module):
             # get the SPR loss
 
             actor_spr_grad = None
-            if self.actor_self_predict_repr:
+            if exists(self.ssl_type):
                 actor_embed = self.actor(state)
                 actor_spr_grad = get_spr_grad(
                     actor_embed,
@@ -864,7 +941,7 @@ class StreamingACLambda(Module):
             # critic SPR loss
 
             critic_spr_grad = None
-            if self.critic_self_predict_repr:
+            if exists(self.ssl_type):
                 critic_spr_grad = get_spr_grad(
                     critic_embed,
                     self.critic,
@@ -1018,10 +1095,10 @@ class StreamingACLambda(Module):
         if self.use_critic_ema:
             self.critic_ema.update()
 
-        if self.actor_self_predict_repr and exists(self.actor_spr_ema):
+        if exists(self.ssl_type) and exists(self.actor_spr_ema):
             self.actor_spr_ema.update()
 
-        if self.critic_self_predict_repr and exists(self.critic_spr_ema):
+        if exists(self.ssl_type) and exists(self.critic_spr_ema):
             self.critic_spr_ema.update()
 
         return UpdateMetrics(

@@ -196,3 +196,15 @@ $ uv run train_lunar.py
     url     = {https://arxiv.org/abs/2204.00616},
 }
 ```
+
+```bibtex
+@misc{schmidt2024learningactactions,
+    title   = {Learning to Act without Actions},
+    author  = {Dominik Schmidt and Minqi Jiang},
+    year    = {2024},
+    eprint  = {2312.10812},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2312.10812},
+}
+```

@@ -22,9 +22,6 @@ from streaming_deep_rl.streaming_deep_rl import StreamingACLambda
 
 # helpers
 
-def exists(v):
-    return v is not None
-
 def divisible_by(num, den):
     return (num % den) == 0
 
@@ -35,9 +32,11 @@ def sanity_test(
     dim = 64,
     depth = 3,
     adaptive = False,
+    lapo = False,
     spr = False,
     spr_target_embed_from_ema = False,
     spr_sigreg_weight = 0.1,
+    spr_dim_hidden_expand_factor = 4,
     spr_use_sem = False,
     spr_sem_dim_simplex = 8,
     spr_sem_temperature = 0.1,
@@ -55,6 +54,28 @@ def sanity_test(
     actor = ResidualNormedMLP(dim_in = dim_state, dim_out = dim, dim = dim, depth = depth, residual_every = 1)
     critic = ResidualNormedMLP(dim_in = dim_state, dim_out = dim, dim = dim, depth = depth, residual_every = 1)
 
+    ssl_type = 'lapo' if lapo else ('spr' if spr else None)
+
+    ssl_kwargs = dict(
+        target_embed_from_ema = spr_target_embed_from_ema,
+    )
+
+    if ssl_type == 'spr':
+        ssl_kwargs.update(
+            sigreg_weight = spr_sigreg_weight,
+            dim_hidden_expand_factor = spr_dim_hidden_expand_factor,
+            use_sem = spr_use_sem,
+            sem_dim_simplex = spr_sem_dim_simplex,
+            sem_temperature = spr_sem_temperature,
+        )
+    elif ssl_type == 'lapo':
+        ssl_kwargs.update(
+            expansion_factor = spr_dim_hidden_expand_factor,
+            sem_dim_simplex = spr_sem_dim_simplex,
+            sem_temperature = spr_sem_temperature,
+            pred_action_loss_weight = 1.0,
+        )
+
     agent = StreamingACLambda(
         actor = actor,
         critic = critic,
@@ -66,13 +87,9 @@ def sanity_test(
         actor_lr = 1.0,
         critic_lr = 1.0,
         adaptive = adaptive,
-        actor_self_predict_repr = spr,
-        critic_self_predict_repr = spr,
-        spr_target_embed_from_ema = spr_target_embed_from_ema,
-        spr_sigreg_weight = spr_sigreg_weight,
-        spr_use_sem = spr_use_sem,
-        spr_sem_dim_simplex = spr_sem_dim_simplex,
-        spr_sem_temperature = spr_sem_temperature,
+        ssl_type = ssl_type,
+        spr_kwargs = ssl_kwargs if ssl_type == 'spr' else dict(),
+        lapo_kwargs = ssl_kwargs if ssl_type == 'lapo' else dict(),
         use_minto = use_minto,
         use_delightful_pg = use_delightful_pg,
         use_hl_gauss = use_hl_gauss

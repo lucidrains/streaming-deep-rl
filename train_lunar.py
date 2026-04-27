@@ -52,9 +52,6 @@ VIDEO_FOLDER = './lunar-video-streaming'
 
 # helpers
 
-def exists(v):
-    return v is not None
-
 def divisible_by(num, den):
     return (num % den) == 0
 
@@ -128,10 +125,14 @@ def main(
     render_every_eps = 250,
     cpu = True,
     adaptive = True,
+    lapo = False,
     spr = False,
     spr_use_sem = False,
     spr_target_embed_from_ema = False,
     spr_sigreg_weight = 0.1,
+    spr_dim_hidden_expand_factor = 4,
+    spr_sem_dim_simplex = 8,
+    spr_sem_temperature = 0.1,
     init_sparsity = 0.9,
     dim_actor = 128,
     dim_critic = 128,
@@ -209,6 +210,28 @@ def main(
         residual_every = 1,
     ).to(device)
 
+    ssl_type = 'lapo' if lapo else ('spr' if spr else None)
+
+    ssl_kwargs = dict(
+        target_embed_from_ema = spr_target_embed_from_ema,
+    )
+
+    if ssl_type == 'spr':
+        ssl_kwargs.update(
+            sigreg_weight = spr_sigreg_weight,
+            dim_hidden_expand_factor = spr_dim_hidden_expand_factor,
+            use_sem = spr_use_sem,
+            sem_dim_simplex = spr_sem_dim_simplex,
+            sem_temperature = spr_sem_temperature,
+        )
+    elif ssl_type == 'lapo':
+        ssl_kwargs.update(
+            expansion_factor = spr_dim_hidden_expand_factor,
+            sem_dim_simplex = spr_sem_dim_simplex,
+            sem_temperature = spr_sem_temperature,
+            pred_action_loss_weight = 1.0,
+        )
+
     agent = StreamingACLambda(
         actor = actor,
         critic = critic,
@@ -223,11 +246,9 @@ def main(
         eligibility_trace_decay = eligibility_trace_decay,
         dim_critic = dim_critic,
         init_sparsity = init_sparsity,
-        spr_use_sem = spr_use_sem,
-        actor_self_predict_repr = spr,
-        critic_self_predict_repr = spr,
-        spr_target_embed_from_ema = spr_target_embed_from_ema,
-        spr_sigreg_weight = spr_sigreg_weight,
+        ssl_type = ssl_type,
+        spr_kwargs = ssl_kwargs if ssl_type == 'spr' else dict(),
+        lapo_kwargs = ssl_kwargs if ssl_type == 'lapo' else dict(),
         l2_weight_decay = l2_weight_decay,
         l1_weight_decay = l1_weight_decay,
         cautious_wd = cautious_wd,

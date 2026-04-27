@@ -3,13 +3,11 @@ param = pytest.mark.parametrize
 
 import torch
 
-@param('actor_self_predict_repr', (False, True))
-@param('critic_self_predict_repr', (False, True))
+@param('ssl_type', (None, 'spr', 'lapo'))
 @param('spr_target_embed_from_ema', (False, True))
 @param('spr_use_sem', (False, True))
 def test_streaming(
-    actor_self_predict_repr,
-    critic_self_predict_repr,
+    ssl_type,
     spr_target_embed_from_ema,
     spr_use_sem
 ):
@@ -24,6 +22,20 @@ def test_streaming(
 
     critic = MLP(5, 128, norm_elementwise_affine = False, activate_last = False)
 
+    ssl_kwargs = dict(
+        target_embed_from_ema = spr_target_embed_from_ema,
+    )
+
+    if ssl_type == 'spr':
+        ssl_kwargs.update(
+            use_sem = spr_use_sem,
+            sigreg_weight = 1.0 if not spr_target_embed_from_ema else 0.0
+        )
+    elif ssl_type == 'lapo':
+        ssl_kwargs.update(
+            pred_action_loss_weight = 1.0
+        )
+
     streaming_actor_critic = StreamingACLambda(
         actor = actor,
         critic = critic,
@@ -31,11 +43,9 @@ def test_streaming(
         dim_state = 5,
         dim_actor = 128,
         dim_critic = 128,
-        actor_self_predict_repr = actor_self_predict_repr,
-        critic_self_predict_repr = critic_self_predict_repr,
-        spr_target_embed_from_ema = spr_target_embed_from_ema,
-        spr_sigreg_weight = 1.0 if not spr_target_embed_from_ema else 0.0,
-        spr_use_sem = spr_use_sem
+        ssl_type = ssl_type,
+        spr_kwargs = ssl_kwargs if ssl_type == 'spr' else dict(),
+        lapo_kwargs = ssl_kwargs if ssl_type == 'lapo' else dict()
     )
 
     streaming_actor_critic.reset_trace_()
