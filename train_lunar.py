@@ -127,8 +127,8 @@ def main(
     adaptive = True,
     lapo = False,
     spr = False,
-    spr_use_sem = True,
-    spr_target_embed_from_ema = False,
+    spr_use_sem = False,
+    spr_target_embed_from_ema = True,
     spr_sigreg_weight = 0.1,
     spr_dim_hidden_expand_factor = 4,
     spr_sem_dim_simplex = 8,
@@ -144,7 +144,8 @@ def main(
     use_minto = False,
     use_delightful_pg = False,
     delightful_eta = 1.0,
-    depth = 3
+    depth = 3,
+    use_chunked_td = False
 ):
     if render:
         rmtree(VIDEO_FOLDER, ignore_errors = True)
@@ -256,7 +257,8 @@ def main(
         use_critic_ema = use_critic_ema,
         use_minto = use_minto,
         use_delightful_pg = use_delightful_pg,
-        delightful_eta = delightful_eta
+        delightful_eta = delightful_eta,
+        use_chunked_td = use_chunked_td
     )
 
     # metrics
@@ -281,7 +283,8 @@ def main(
         use_critic_ema = use_critic_ema,
         use_minto = use_minto,
         use_delightful_pg = use_delightful_pg,
-        delightful_eta = delightful_eta
+        delightful_eta = delightful_eta,
+        use_chunked_td = use_chunked_td
     ))
 
     # training loop
@@ -358,6 +361,22 @@ def main(
             )
 
             live.update(dashboard.create_renderable())
+
+            # wandb logging
+
+            if use_wandb:
+                accelerator.log(dict(
+                    episode_reward = eps_reward,
+                    avg_reward_100 = avg_reward,
+                    episode_steps = eps_steps,
+                    avg_steps_100 = avg_steps,
+                    td_error = metrics.td_error,
+                    value_pred = metrics.value_pred,
+                    chunked_td_lambda = metrics.chunked_td_lambda,
+                ), step = episode)
+
+    if use_wandb:
+        accelerator.end_training()
 
 if __name__ == '__main__':
     fire.Fire(main)

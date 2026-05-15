@@ -5,8 +5,9 @@ from typing import NamedTuple, Literal
 
 import torch
 import torch.nn.functional as F
-from torch import nn, tensor, is_tensor, cat, stack
+from torch import nn, tensor, is_tensor, cat, Tensor
 from torch.nn import Module, Linear, Sequential
+from torch.nn.utils import parameters_to_vector
 
 import einx
 from einops import rearrange, reduce
@@ -14,7 +15,7 @@ from einops.layers.torch import Rearrange
 
 from discrete_continuous_embed_readout import Readout, Embed
 
-from torch_einops_utils import tree_map_tensor, pack_with_inverse, masked_mean
+from torch_einops_utils import tree_map_tensor, masked_mean
 
 from ema_pytorch import EMA
 
@@ -59,6 +60,10 @@ def l2norm(t):
 
 # return types
 
+class SSLLosses(NamedTuple):
+    total: Tensor
+    recon: Tensor
+
 class UpdateMetrics(NamedTuple):
     td_error: float
     value_pred: float
@@ -68,6 +73,7 @@ class UpdateMetrics(NamedTuple):
     critic_trace_norm: float
     actor_scale: float
     critic_scale: float
+    chunked_td_lambda: float
 
 # initialization
 
@@ -102,23 +108,35 @@ def sparse_init_(
 # orthogonal projection for SPR in streaming setting
 # https://arxiv.org/abs/2602.09396
 
-def orthog_project(x, y):
-    x, inverse_pack = pack_with_inverse(x, '*')
-    y, _ = pack_with_inverse(y, '*')
+def orthog_project_tensors(
+    grads: list[Tensor],
+    moms: list[Tensor]
+):
+    if len(grads) == 0:
+        return []
 
-    dtype = x.dtype
+    flat_grad = parameters_to_vector(grads)
+    flat_mom = parameters_to_vector(moms)
 
-    if x.device.type != 'mps':
-        x, y = x.double(), y.double()
+    dtype = flat_grad.dtype
 
-    unit = l2norm(y)
+    if flat_grad.device.type != 'mps':
+        flat_grad, flat_mom = flat_grad.double(), flat_mom.double()
 
-    parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
-    orthog = x - parallel
+    unit = l2norm(flat_mom)
+    orthog = flat_grad - (flat_grad * unit).sum(dim = -1, keepdim = True) * unit
 
-    orthog = inverse_pack(orthog, '*')
+    orthog = orthog.to(dtype)
 
-    return orthog.to(dtype)
+    orthog_grads = []
+    offset = 0
+
+    for g in grads:
+        numel = g.numel()
+        orthog_grads.append(orthog[offset:offset + numel].view_as(g))
+        offset += numel
+
+    return orthog_grads
 
 # Simplicial Embeddings
 # Lavoie et al - https://arxiv.org/abs/2204.00616
@@ -229,12 +247,14 @@ class SelfPredictRepr(Module):
 
         # cosine sim loss
 
-        loss = F.mse_loss(l2norm(predicted), l2norm(next_projected))
+        recon_loss = F.mse_loss(l2norm(predicted), l2norm(next_projected))
 
-        if not self.apply_sigreg:
-            return loss
+        total_loss = recon_loss
 
-        return loss + self.sigreg_weight * sigreg(projected)
+        if self.apply_sigreg:
+            total_loss = total_loss + self.sigreg_weight * sigreg(projected)
+
+        return SSLLosses(total = total_loss, recon = recon_loss)
 
 # Dominik Schmidt https://arxiv.org/abs/2312.10812
 
@@ -325,7 +345,7 @@ class LAPO(Module):
 
         # lapo actually does a decoder back to state in pixel space, although probably not crucial given SPR
 
-        return recon_loss + pred_action_loss
+        return SSLLosses(total = recon_loss + pred_action_loss, recon = recon_loss)
 
 # sigreg from lejepa
 
@@ -562,7 +582,8 @@ class StreamingACLambda(Module):
         use_hl_gauss = False,
         hl_gauss_val_min = -3.,
         hl_gauss_val_max = 3.,
-        hl_gauss_num_bins = 64
+        hl_gauss_num_bins = 64,
+        use_chunked_td = False
     ):
         super().__init__()
 
@@ -570,6 +591,11 @@ class StreamingACLambda(Module):
 
         assert not (use_minto and not use_critic_ema), 'minto can only be used with critic ema'
         self.use_minto = use_minto
+
+        # chunked td
+
+        assert not (use_chunked_td and ssl_type is None), 'chunked td requires a predictive model (ssl_type)'
+        self.use_chunked_td = use_chunked_td
 
         # delightful pg
 
@@ -858,7 +884,8 @@ class StreamingACLambda(Module):
 
             # actor with entropy regularization
 
-            action_logits = self.actor_with_readout(state)
+            actor_embed = self.actor(state)
+            action_logits = self.readout(actor_embed)
             log_prob = self.readout.log_prob(action_logits, action).mean()
             entropy = self.readout.entropy(action_logits).mean()
 
@@ -896,12 +923,12 @@ class StreamingACLambda(Module):
 
                 # loss
 
-                spr_loss = spr_module(embed, action, next_embed, ema_to_projection = ema_to_projection)
+                ssl_losses = spr_module(embed, action, next_embed, ema_to_projection = ema_to_projection)
 
-                # gradients
+                # gradients (use total loss for backprop)
 
                 spr_params = list(spr_module.parameters())
-                spr_grads_tup = torch.autograd.grad(spr_loss, network_params + spr_params, retain_graph = True, allow_unused = True)
+                spr_grads_tup = torch.autograd.grad(ssl_losses.total, network_params + spr_params, retain_graph = True, allow_unused = True)
                 spr_grads_tup = tuple(default(g, torch.zeros_like(p)) for g, p in zip(spr_grads_tup, network_params + spr_params))
 
                 spr_grad = {name: grad for (name, _), grad in zip(network_with_readout.named_parameters(), spr_grads_tup[:len(network_params)])}
@@ -910,35 +937,41 @@ class StreamingACLambda(Module):
                 # orth¹: project SPR encoder grads orthogonal to their own EMA momentum
                 # this decorrelates the highly correlated streaming data
 
-                names = list(spr_grad.keys())
-                all_grads = [spr_grad[n] for n in names] + spr_only_grad
-                all_moms = [spr_momentum[n] for n in names] + list(spr_aux_momentum.values())
+                enc_names = [n for n in spr_grad.keys() if n.startswith('0.')]
+                enc_grads = [spr_grad[n] for n in enc_names]
+                enc_moms = [spr_momentum[n] for n in enc_names]
 
-                all_grads_proj = [orthog_project(g, m) for g, m in zip(all_grads, all_moms)]
+                enc_grads_proj = orthog_project_tensors(enc_grads, enc_moms)
+
+                aux_grads = spr_only_grad
+                aux_moms = list(spr_aux_momentum.values())
+                aux_grads_proj = orthog_project_tensors(aux_grads, aux_moms)
 
                 # momentum update
 
-                for grad, mom in zip(all_grads, all_moms):
+                for grad, mom in zip([*enc_grads, *aux_grads], [*enc_moms, *aux_moms]):
                     mom.mul_(self.spr_orth_beta).add_(grad, alpha = 1. - self.spr_orth_beta)
 
-                for name, proj_grad in zip(names, all_grads_proj[:len(names)]):
+                for name, proj_grad in zip(enc_names, enc_grads_proj):
                     spr_grad[name] = proj_grad
 
-                spr_only_grad = all_grads_proj[len(names):]
+                spr_only_grad = aux_grads_proj
 
                 # update SPR auxiliary networks via SGD with dedicated spr_lr
 
                 for param, grad in zip(spr_params, spr_only_grad):
                     param.data.add_(grad, alpha = -self.spr_lr)
 
-                return spr_grad
+                # return recon-only loss for chunked-td (not contaminated by sigreg / action loss)
+
+                return spr_grad, ssl_losses.recon.detach()
 
             # get the SPR loss
 
             actor_spr_grad = None
+            actor_spr_loss = None
             if exists(self.ssl_type):
-                actor_embed = self.actor(state)
-                actor_spr_grad = get_spr_grad(
+                actor_spr_grad, actor_spr_loss = get_spr_grad(
                     actor_embed,
                     self.actor,
                     self.actor_with_readout,
@@ -953,8 +986,9 @@ class StreamingACLambda(Module):
             # critic SPR loss
 
             critic_spr_grad = None
+            critic_spr_loss = None
             if exists(self.ssl_type):
-                critic_spr_grad = get_spr_grad(
+                critic_spr_grad, critic_spr_loss = get_spr_grad(
                     critic_embed,
                     self.critic,
                     self.critic_full,
@@ -981,6 +1015,12 @@ class StreamingACLambda(Module):
         # update eligibility traces
 
         decay = self.eligibility_trace_decay * self.discount_factor
+
+        chunked_td_lambda = 1.
+
+        if self.use_chunked_td and exists(critic_spr_loss):
+            chunked_td_lambda = max(0., 1. - critic_spr_loss.item() / 2.)
+            decay = decay * chunked_td_lambda
 
         for name, trace in self.actor_trace.items():
             trace.mul_(decay).add_(actor_grad[name] * gate)
@@ -1030,12 +1070,24 @@ class StreamingACLambda(Module):
 
             global_scale = (kappa * td_error_factor * trace_sum).reciprocal().clamp(max = 1.)
 
-            for name, param in params.named_parameters():
-                update = adapted_grads[name] * lr
+            rl_updates = {name: adapted_grads[name] * lr for name, _ in params.named_parameters()}
 
-                if exists(spr_grads) and name in spr_grads:
-                    spr_update = -spr_grads[name] * self.spr_lr_param_update
-                    update = update + orthog_project(spr_update, update)
+            if exists(spr_grads):
+                enc_names = [n for n in spr_grads.keys() if n.startswith('0.')]
+                enc_spr_updates = [-spr_grads[n] * self.spr_lr_param_update for n in enc_names]
+                enc_rl_updates = [rl_updates[n] for n in enc_names]
+                
+                enc_spr_updates_proj = orthog_project_tensors(enc_spr_updates, enc_rl_updates)
+                
+                spr_updates_proj = {n: g for n, g in zip(enc_names, enc_spr_updates_proj)}
+            else:
+                spr_updates_proj = {}
+
+            for name, param in params.named_parameters():
+                update = rl_updates[name]
+
+                if name in spr_updates_proj:
+                    update = update + spr_updates_proj[name]
 
                 update = update * global_scale
 
@@ -1121,7 +1173,8 @@ class StreamingACLambda(Module):
             actor_trace_norm = actor_trace_norm.item(),
             critic_trace_norm = critic_trace_norm.item(),
             actor_scale = actor_scale.item(),
-            critic_scale = critic_scale.item()
+            critic_scale = critic_scale.item(),
+            chunked_td_lambda = chunked_td_lambda
         )
 
     @torch.no_grad()
