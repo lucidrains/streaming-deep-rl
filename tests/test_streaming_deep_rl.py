@@ -6,10 +6,12 @@ import torch
 @param('ssl_type', (None, 'spr', 'lapo'))
 @param('spr_target_embed_from_ema', (False, True))
 @param('spr_use_sem', (False, True))
+@param('spr_sigreg_num_subspaces', (1, 16))
 def test_streaming(
     ssl_type,
     spr_target_embed_from_ema,
-    spr_use_sem
+    spr_use_sem,
+    spr_sigreg_num_subspaces
 ):
 
     from streaming_deep_rl.streaming_deep_rl import (
@@ -29,7 +31,8 @@ def test_streaming(
     if ssl_type == 'spr':
         ssl_kwargs.update(
             use_sem = spr_use_sem,
-            sigreg_weight = 1.0 if not spr_target_embed_from_ema else 0.0
+            sigreg_weight = 1.0 if not spr_target_embed_from_ema else 0.0,
+            sigreg_num_subspaces = spr_sigreg_num_subspaces
         )
     elif ssl_type == 'lapo':
         ssl_kwargs.update(

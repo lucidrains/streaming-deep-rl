@@ -36,6 +36,7 @@ def sanity_test(
     spr = False,
     spr_target_embed_from_ema = False,
     spr_sigreg_weight = 0.1,
+    spr_sigreg_num_subspaces = 1,
     spr_dim_hidden_expand_factor = 4,
     spr_use_sem = True,
     spr_sem_dim_simplex = 8,
@@ -63,6 +64,7 @@ def sanity_test(
     if ssl_type == 'spr':
         ssl_kwargs.update(
             sigreg_weight = spr_sigreg_weight,
+            sigreg_num_subspaces = spr_sigreg_num_subspaces,
             dim_hidden_expand_factor = spr_dim_hidden_expand_factor,
             use_sem = spr_use_sem,
             sem_dim_simplex = spr_sem_dim_simplex,

@@ -5,7 +5,7 @@ from typing import NamedTuple, Literal
 
 import torch
 import torch.nn.functional as F
-from torch import nn, tensor, is_tensor, cat, Tensor
+from torch import nn, tensor, is_tensor, cat, stack, Tensor
 from torch.nn import Module, Linear, Sequential
 from torch.nn.utils import parameters_to_vector
 
@@ -186,6 +186,7 @@ class SelfPredictRepr(Module):
         dim_predict = None,
         target_embed_from_ema = True, # whether the target embed is from an EMA, or from the model itself (traditional vs sigreg from lejepa)
         sigreg_weight = 0.,
+        sigreg_num_subspaces = 1,
         dim_hidden_expand_factor = 4,
         use_sem = True,
         sem_dim_simplex = 8,
@@ -214,6 +215,18 @@ class SelfPredictRepr(Module):
 
         self.apply_sigreg = sigreg_weight > 0.
         self.sigreg_weight = sigreg_weight
+
+        # sub-jepa subspace gaussian regularization
+        # Kai Zhao et al https://arxiv.org/abs/2605.09241v1
+
+        self.num_subspaces = sigreg_num_subspaces
+
+        if self.num_subspaces > 1:
+            dim_subspace, remainder = divmod(dim_predict, self.num_subspaces)
+            assert remainder == 0, f'dimension {dim_predict} must be divisible by number of subspaces {self.num_subspaces}'
+
+            projs = stack([nn.init.orthogonal_(torch.empty(dim_subspace, dim_predict)) for _ in range(self.num_subspaces)])
+            self.register_buffer('subspace_projs', projs)
 
         self.use_sem = use_sem
         self.sem = SEM(dim_predict, dim_in = dim_embed, project_in = True, temperature = sem_temperature, dim_simplex = sem_dim_simplex) if use_sem else nn.Identity()
@@ -252,7 +265,14 @@ class SelfPredictRepr(Module):
         total_loss = recon_loss
 
         if self.apply_sigreg:
-            total_loss = total_loss + self.sigreg_weight * sigreg(projected)
+            sigreg_input = projected
+
+            if self.num_subspaces > 1:
+                sigreg_input = einx.dot('... dim, k dim_subspace dim -> k ... dim_subspace', sigreg_input, self.subspace_projs)
+            else:
+                sigreg_input = rearrange(sigreg_input, '... d -> 1 ... d')
+
+            total_loss = total_loss + self.sigreg_weight * sigreg(sigreg_input)
 
         return SSLLosses(total = total_loss, recon = recon_loss)
 
@@ -357,6 +377,7 @@ def sigreg(
     mask = None
 ):
     # Randall Balestriero - https://arxiv.org/abs/2511.08544
+    # Sub-JEPA - https://arxiv.org/abs/2605.09241v1
 
     dim, device = x.shape[-1], x.device
 
@@ -375,13 +396,13 @@ def sigreg(
 
     # empirical CF
 
-    x_t = einx.dot('... d, m d -> (...) m', x, rand_projs)
+    x_t = einx.dot('k ... d, m d -> k (...) m', x, rand_projs)
 
-    x_t = einx.multiply('n m, t -> n m t', x_t, t)
+    x_t = einx.multiply('k n m, t -> k n m t', x_t, t)
     ecf = (1j * x_t).exp()
 
-    mask_1d = rearrange(mask, '... -> (...)') if exists(mask) else None
-    ecf = masked_mean(ecf, mask_1d, dim = 0)
+    mask_1d = rearrange(mask, 'k ... -> k (...)') if exists(mask) else None
+    ecf = masked_mean(ecf, mask_1d, dim = 1)
 
     # weighted L2 distance
 
@@ -1032,8 +1053,8 @@ class StreamingACLambda(Module):
 
         td_error_factor = td_error.abs().clamp(min = 1.)
 
-        actor_grad_norm = torch.stack([g.norm(p = 1) for g in actor_grad.values()]).mean()
-        critic_grad_norm = torch.stack([g.norm(p = 1) for g in value_grad.values()]).mean()
+        actor_grad_norm = stack([g.norm(p = 1) for g in actor_grad.values()]).mean()
+        critic_grad_norm = stack([g.norm(p = 1) for g in value_grad.values()]).mean()
 
         if self.adaptive:
             self.step.add_(1)
@@ -1076,9 +1097,9 @@ class StreamingACLambda(Module):
                 enc_names = [n for n in spr_grads.keys() if n.startswith('0.')]
                 enc_spr_updates = [-spr_grads[n] * self.spr_lr_param_update for n in enc_names]
                 enc_rl_updates = [rl_updates[n] for n in enc_names]
-                
+
                 enc_spr_updates_proj = orthog_project_tensors(enc_spr_updates, enc_rl_updates)
-                
+
                 spr_updates_proj = {n: g for n, g in zip(enc_names, enc_spr_updates_proj)}
             else:
                 spr_updates_proj = {}
