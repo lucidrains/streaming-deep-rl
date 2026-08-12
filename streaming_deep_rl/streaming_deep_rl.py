@@ -492,7 +492,7 @@ class ScaleRewardNormalizer(Module):
         eps = 1e-5,
         discount_factor = 0.999,
         time_dilate_factor = 1.,
-        mean_center = False
+        mean_center = True
     ):
         super().__init__()
         self.eps = eps
@@ -502,6 +502,7 @@ class ScaleRewardNormalizer(Module):
 
         self.register_buffer('step', tensor(1))
         self.register_buffer('running_reward', tensor(0.))
+        self.register_buffer('running_mean', tensor(0.))
         self.register_buffer('running_estimate_p', tensor(0.))
 
     def reset_step(self):
@@ -538,18 +539,19 @@ class ScaleRewardNormalizer(Module):
         time = self.time.item()
 
         running_reward = self.running_reward.item()
+        running_mean = self.running_mean.item()
         estimate_p = self.running_estimate_p.item()
 
         next_reward = running_reward * self.discount_factor * (1. - float(is_terminal)) + reward
 
-        mu_hat = next_reward
-
         # rewards are not mean centered
 
         if self.mean_center:
-            mu_hat = mu_hat - next_reward / time
-
-        next_estimate_p = estimate_p + next_reward * mu_hat
+            next_mean = running_mean + (next_reward - running_mean) / time
+            next_estimate_p = estimate_p + (next_reward - running_mean) * (next_reward - next_mean)
+            self.running_mean.copy_(next_mean)
+        else:
+            next_estimate_p = estimate_p + next_reward * next_reward
 
         self.running_reward.copy_(next_reward)
         self.running_estimate_p.copy_(next_estimate_p)
