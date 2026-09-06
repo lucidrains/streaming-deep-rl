@@ -68,3 +68,14 @@ def test_streaming(
 
     streaming_actor_critic.save('./test_streaming_ckpt.pt')
     streaming_actor_critic.load('./test_streaming_ckpt.pt')
+
+
+def test_sparse_init_small_fan_in():
+    from streaming_deep_rl.streaming_deep_rl import sparse_init_
+
+    # For small fan-in (e.g. state_dim = 1, 2, 4, 8), ceil(0.9 * fan_in) could equal fan_in,
+    # zeroing out 100% of weights. The clamp ensures at least 1 non-zero weight per neuron.
+    for fan_in in [1, 2, 4, 8]:
+        layer = torch.nn.Linear(fan_in, 64)
+        sparse_init_(layer, sparsity = 0.9)
+        assert (layer.weight != 0).any(dim = -1).all(), f"All weights zeroed for fan_in={fan_in}"

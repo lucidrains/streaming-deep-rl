@@ -96,6 +96,8 @@ def sparse_init_(
     assert 0. <= sparsity <= 1.
 
     num_zeros = int(math.ceil(sparsity * fan_in))
+    if sparsity < 1.0:
+        num_zeros = min(fan_in - 1, num_zeros)
 
     random_scores = torch.randn(fan_out, fan_in, device = device)
     zero_indices = random_scores.argsort(dim = -1)[:, :num_zeros]
