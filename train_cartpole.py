@@ -18,6 +18,7 @@ import torch
 import gymnasium as gym
 
 from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
+from torch_einops_utils import log_table
 from streaming_deep_rl.streaming_deep_rl import StreamingACLambda
 
 # helpers
@@ -124,7 +125,7 @@ def sanity_test(
 
         if divisible_by(eps + 1, print_every):
             avg = np.mean(rolling_reward)
-            print(f'episode {eps + 1}: avg reward {avg:.1f}')
+            log_table(episode = eps + 1, avg_reward = avg, formatters = dict(avg_reward = '.1f'))
 
             if avg >= converge_threshold:
                 print(f'converged at episode {eps + 1}')

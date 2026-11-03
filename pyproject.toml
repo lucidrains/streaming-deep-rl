@@ -1,12 +1,12 @@
 [project]
 name = "streaming-deep-rl"
-version = "0.3.6"
+version = "0.3.8"
 description = "Streaming Deep Reinforcement Learning"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
 ]
 readme = "README.md"
-requires-python = ">= 3.9"
+requires-python = ">= 3.10"
 license = { file = "LICENSE" }
 keywords = [
     'artificial intelligence',
@@ -28,8 +28,9 @@ dependencies = [
     "einx>=0.3.0",
     "einops>=0.8.1",
     "ema-pytorch",
+    "hl-gauss-pytorch",
     "torch>=2.4",
-    "torch-einops-utils",
+    "torch-einops-utils>=0.2.4",
     "x-mlps-pytorch>=0.3.3",
 ]
 

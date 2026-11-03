@@ -79,3 +79,14 @@ def test_sparse_init_small_fan_in():
         layer = torch.nn.Linear(fan_in, 64)
         sparse_init_(layer, sparsity = 0.9)
         assert (layer.weight != 0).any(dim = -1).all(), f"All weights zeroed for fan_in={fan_in}"
+
+def test_orthog_project_tensors():
+    from streaming_deep_rl.streaming_deep_rl import orthog_project_tensors
+
+    grads = [torch.tensor([1., 0.]), torch.tensor([0., 1.])]
+    moms = [torch.tensor([1., 0.]), torch.tensor([0., 0.])]
+
+    projected = orthog_project_tensors(grads, moms)
+
+    assert torch.allclose(projected[0], torch.zeros(2))
+    assert torch.allclose(projected[1], torch.tensor([0., 1.]))

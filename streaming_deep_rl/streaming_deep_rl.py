@@ -15,7 +15,7 @@ from einops.layers.torch import Rearrange
 
 from discrete_continuous_embed_readout import Readout, Embed
 
-from torch_einops_utils import tree_map_tensor, masked_mean
+from torch_einops_utils import tree_map_tensor, masked_mean, orthogonal_component, dict_add
 
 from ema_pytorch import EMA
 
@@ -125,20 +125,10 @@ def orthog_project_tensors(
     if flat_grad.device.type != 'mps':
         flat_grad, flat_mom = flat_grad.double(), flat_mom.double()
 
-    unit = l2norm(flat_mom)
-    orthog = flat_grad - (flat_grad * unit).sum(dim = -1, keepdim = True) * unit
+    flat_orth = orthogonal_component(flat_grad, flat_mom).to(dtype)
 
-    orthog = orthog.to(dtype)
-
-    orthog_grads = []
-    offset = 0
-
-    for g in grads:
-        numel = g.numel()
-        orthog_grads.append(orthog[offset:offset + numel].view_as(g))
-        offset += numel
-
-    return orthog_grads
+    sizes = [grad.numel() for grad in grads]
+    return [part.view_as(grad) for part, grad in zip(flat_orth.split(sizes), grads)]
 
 # Simplicial Embeddings
 # Lavoie et al - https://arxiv.org/abs/2204.00616
@@ -578,8 +568,8 @@ class StreamingACLambda(Module):
         eligibility_trace_decay = 0.8,
         actor_kappa = 3.,
         critic_kappa = 2.,
-        actor_lr = 1.0,
-        critic_lr = 1.0,
+        actor_lr = 10.0,
+        critic_lr = 10.0,
         adaptive = True,
         adam_beta1 = 0.9,
         adam_beta2 = 0.999,
@@ -1104,17 +1094,14 @@ class StreamingACLambda(Module):
 
                 enc_spr_updates_proj = orthog_project_tensors(enc_spr_updates, enc_rl_updates)
 
-                spr_updates_proj = {n: g for n, g in zip(enc_names, enc_spr_updates_proj)}
+                spr_updates_proj = dict(zip(enc_names, enc_spr_updates_proj))
             else:
                 spr_updates_proj = {}
 
+            updates = dict_add(rl_updates, spr_updates_proj)
+
             for name, param in params.named_parameters():
-                update = rl_updates[name]
-
-                if name in spr_updates_proj:
-                    update = update + spr_updates_proj[name]
-
-                update = update * global_scale
+                update = updates[name] * global_scale
 
                 # add gradient update first
 

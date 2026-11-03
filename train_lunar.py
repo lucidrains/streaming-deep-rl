@@ -20,6 +20,7 @@ import torch
 import numpy as np
 import fire
 from collections import deque
+from contextlib import nullcontext
 from shutil import rmtree
 
 from torch import tensor, nn
@@ -42,6 +43,8 @@ from rich.progress import (
 )
 
 from accelerate import Accelerator
+
+from torch_einops_utils import log_table
 
 from streaming_deep_rl.streaming_deep_rl import StreamingACLambda
 from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
@@ -115,14 +118,17 @@ class Dashboard:
 def main(
     num_episodes = 20_000,
     max_timesteps = 1000,
-    actor_lr = 1.0,
-    critic_lr = 1.0,
+    actor_lr = 10.0,
+    critic_lr = 10.0,
     entropy_weight = 0.01,
     discount_factor = 0.99,
     eligibility_trace_decay = 0.8,
     use_wandb = False,
     render = True,
     render_every_eps = 250,
+    log_every = 0,
+    stop_when_solved = False,
+    seed = 1,
     cpu = True,
     adaptive = True,
     lapo = False,
@@ -149,6 +155,10 @@ def main(
 ):
     if render:
         rmtree(VIDEO_FOLDER, ignore_errors = True)
+
+    if seed is not None:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
 
     # accelerator
 
@@ -289,9 +299,13 @@ def main(
 
     # training loop
 
-    with Live(dashboard.create_renderable(), refresh_per_second = 4) as live:
+    use_live = log_every <= 0
+    live_context = Live(dashboard.create_renderable(), refresh_per_second = 4) if use_live else nullcontext()
+
+    with live_context as live:
         for episode in range(num_episodes):
-            state_np, _ = env.reset()
+            reset_kwargs = dict(seed = seed + episode + 1) if seed is not None else dict()
+            state_np, _ = env.reset(**reset_kwargs)
             state = torch.from_numpy(state_np).float().to(device)
 
             eps_reward = 0.0
@@ -338,7 +352,8 @@ def main(
                     last_eps_steps = eps_steps
                 )
 
-                live.update(dashboard.create_renderable())
+                if use_live:
+                    live.update(dashboard.create_renderable())
 
                 state = next_state
                 eps_reward += reward
@@ -360,7 +375,21 @@ def main(
                 avg_steps_100 = f"{avg_steps:.1f}"
             )
 
-            live.update(dashboard.create_renderable())
+            if use_live:
+                live.update(dashboard.create_renderable())
+
+            if log_every > 0 and divisible_by(episode + 1, log_every):
+                log_table(
+                    ep = episode + 1,
+                    reward = eps_reward,
+                    steps = eps_steps,
+                    avg100 = avg_reward,
+                    formatters = dict(reward = '.2f', avg100 = '.2f')
+                )
+
+            if stop_when_solved and len(rolling_reward) == rolling_reward.maxlen and avg_reward >= 200.:
+                print(f'SOLVED at episode {episode + 1} with avg100 {avg_reward:.2f}', flush = True)
+                break
 
             # wandb logging
 
