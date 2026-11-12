@@ -69,6 +69,39 @@ agent.update(
 )
 ```
 
+## Continual Plasticity (`reborn_`, `crossover_distill` & `AgentPool`)
+
+Consolidate the current policy/value into `[0 : keep_dim]` with independent subspace normalization (`SplitNorm`), while reinitializing `[keep_dim : dim]` as a sparse plastic reservoir. Supports standalone two-parent phenotypic distillation crossover (`crossover_distill`, decided per probe state by the parents' value critics) and `AgentPool` for single-stream natural selection, crossover, and specialist archive recall (with zero-overhead fallback when `pool_size = 1`, and `pool.eval()` routing to `pool.best_agent`).
+
+```python
+from streaming_deep_rl import StreamingACLambda, AgentPool, crossover_distill
+
+agent = StreamingACLambda(
+    actor = actor,
+    critic = critic,
+    dim_state = 8,
+    dim_actor = 64,
+    dim_critic = 64,
+    num_discrete_actions = 4,
+    reborn_sparsity = 0.9,      # fresh-half sparsity
+    reborn_grow = True,         # optional width growth
+    reborn_grow_factor = 1.5,
+    reborn_max_dim = 256
+)
+
+# single-stream evolutionary pool (falls back to exact 1-agent behavior when pool_size = 1)
+pool = AgentPool(
+    agent,
+    pool_size = 4,
+    archive_size = 8,
+    actor_selector = 'ucb',      # 'ucb' | 'softmax' | 'round_robin' | 'uniform' | Callable
+    reproduce_fn = 'crossover',  # 'crossover' | 'reborn' | 'lerp' | 'shrink_perturb' | Callable
+    crossover_filter = 'critic', # 'critic' | 'entropy' | 'fitness' | 'random' | Callable
+    novelty_fn = 'kl',           # 'kl' | 'value' | Callable
+    fitness_fn = None            # optional (ep_return, ep_steps, agent) -> float
+)
+```
+
 ## Cartpole
 
 ```bash
@@ -116,6 +149,19 @@ $ uv run train_lunar.py
 ```
 
 ```bibtex
+@article{dohare2024loss,
+    title   = {Loss of Plasticity in Deep Continual Learning},
+    author  = {Dohare, Shibhansh and Hernandez-Garcia, J. Fernando and Lan, Qingfeng and Rahman, Parash and Mahmood, A. Rupam and Sutton, Richard S.},
+    journal = {Nature},
+    volume  = {632},
+    number  = {8026},
+    pages   = {768--774},
+    year    = {2024},
+    url     = {https://arxiv.org/abs/2306.13812},
+}
+```
+
+```bibtex
 @misc{kumar2024maintainingplasticitycontinuallearning,
     title   = {Maintaining Plasticity in Continual Learning via Regenerative Regularization},
     author  = {Saurabh Kumar and Henrik Marklund and Benjamin Van Roy},
@@ -124,6 +170,31 @@ $ uv run train_lunar.py
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2308.11958},
+}
+```
+
+```bibtex
+@inproceedings{furlanello2018born,
+    title   = {Born Again Neural Networks},
+    author  = {Furlanello, Tommaso and Lipton, Zachary and Tschannen, Michael and Itti, Laurent and Anandkumar, Anima},
+    booktitle = {Proceedings of the 35th International Conference on Machine Learning},
+    pages   = {1607--1616},
+    year    = {2018},
+    volume  = {80},
+    series  = {Proceedings of Machine Learning Research},
+    publisher = {PMLR},
+    url     = {https://proceedings.mlr.press/v80/furlanello18a.html},
+}
+```
+
+```bibtex
+@inproceedings{agarwal2022reincarnating,
+    title   = {Reincarnating Reinforcement Learning: Reusing Prior Computation to Accelerate Progress},
+    author  = {Agarwal, Rishabh and Schwarzer, Max and Castro, Pablo Samuel and Courville, Aaron C. and Bellemare, Marc},
+    booktitle = {Advances in Neural Information Processing Systems},
+    year    = {2022},
+    volume  = {35},
+    url     = {https://arxiv.org/abs/2206.01626},
 }
 ```
 
@@ -194,6 +265,19 @@ $ uv run train_lunar.py
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2204.00616},
+}
+```
+
+```bibtex
+@inproceedings{bodnar2020proximal,
+    title     = {Proximal Distilled Evolutionary Reinforcement Learning},
+    author    = {Cristian Bodnar and Ben Day and Pietro Li{\`o}},
+    booktitle = {Proceedings of the AAAI Conference on Artificial Intelligence},
+    volume    = {34},
+    number    = {04},
+    pages     = {3283--3290},
+    year      = {2020},
+    url       = {https://arxiv.org/abs/1906.09807}
 }
 ```
 

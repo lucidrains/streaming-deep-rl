@@ -1,7 +1,9 @@
 from __future__ import annotations
+import copy
 import math
+from collections import deque
 from pathlib import Path
-from typing import NamedTuple, Literal
+from typing import NamedTuple, Literal, Callable, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -22,6 +24,7 @@ from ema_pytorch import EMA
 from hl_gauss_pytorch import HLGaussLayer
 
 from x_mlps_pytorch import MLP
+from x_mlps_pytorch.norms import LayerNorm as XLayerNorm, RMSNorm as XRMSNorm
 
 from streaming_deep_rl.buffer_dict import BufferDict
 
@@ -75,7 +78,43 @@ class UpdateMetrics(NamedTuple):
     critic_scale: float
     chunked_td_lambda: float
 
+class RebornMetrics(NamedTuple):
+    actor_kl: float
+    critic_loss: float
+    dim_actor: int
+    dim_critic: int
+    core_sparsity: float
+    right_sparsity: float
+
 # initialization
+
+@torch.no_grad()
+def sparse_init_tensor_(
+    weight: Tensor,
+    sparsity = 0.9,
+    scale = 1.
+):
+    if weight.numel() == 0:
+        return weight
+
+    device = weight.device
+    fan_out, fan_in = weight.shape
+
+    value = (fan_in ** -0.5) * scale
+    nn.init.uniform_(weight, -value, value)
+
+    assert 0. <= sparsity <= 1.
+
+    num_zeros = int(math.ceil(sparsity * fan_in))
+    if sparsity < 1.0:
+        num_zeros = min(fan_in - 1, num_zeros)
+
+    if num_zeros > 0:
+        random_scores = torch.randn(fan_out, fan_in, device = device)
+        zero_indices = random_scores.argsort(dim = -1)[:, :num_zeros]
+        weight.scatter_(1, zero_indices, 0.)
+
+    return weight
 
 @torch.no_grad()
 def sparse_init_(
@@ -85,27 +124,278 @@ def sparse_init_(
     """
     Algorithm 1
     """
-    weight, bias = l.weight, l.bias
-    device = weight.device
+    sparse_init_tensor_(l.weight, sparsity = sparsity)
 
-    fan_out, fan_in = weight.shape
+    if exists(l.bias):
+        nn.init.zeros_(l.bias)
 
-    value = fan_in ** -0.5
-    nn.init.uniform_(weight, -value, value)
+def round_up_multiple(num: int, multiple: int) -> int:
+    if multiple <= 1:
+        return num
+    return int(math.ceil(num / multiple) * multiple)
 
-    assert 0. <= sparsity <= 1.
+def _tree_select_rows(tree_a, tree_b, mask_b: Tensor):
+    if is_tensor(tree_a):
+        view_mask = mask_b.reshape(-1, *([1] * (tree_a.ndim - 1)))
+        return torch.where(view_mask, tree_b, tree_a)
 
-    num_zeros = int(math.ceil(sparsity * fan_in))
-    if sparsity < 1.0:
-        num_zeros = min(fan_in - 1, num_zeros)
+    if hasattr(tree_a, '_make'):
+        return type(tree_a)._make(_tree_select_rows(a, b, mask_b) for a, b in zip(tree_a, tree_b))
 
-    random_scores = torch.randn(fan_out, fan_in, device = device)
-    zero_indices = random_scores.argsort(dim = -1)[:, :num_zeros]
+    if isinstance(tree_a, (tuple, list)):
+        return type(tree_a)(_tree_select_rows(a, b, mask_b) for a, b in zip(tree_a, tree_b))
 
-    weight.scatter_(1, zero_indices, 0.)
+    return tree_a
 
-    if exists(bias):
-        nn.init.zeros_(bias)
+def _kl_mean(kl) -> Tensor:
+    if is_tensor(kl):
+        return kl.mean()
+    return sum(t.mean() for t in kl if exists(t))
+
+def _probe_entropy(readout: Readout, dist) -> Tensor:
+    ent = readout.entropy(dist)
+    if is_tensor(ent):
+        return ent.reshape(ent.shape[0], -1).mean(dim = -1)
+    return sum(t.reshape(t.shape[0], -1).mean(dim = -1) for t in ent if exists(t))
+
+def _resolve_parent_choice(
+    filter_fn: str | Callable,
+    probes: Tensor,
+    dists: tuple,
+    vals: tuple[Tensor, Tensor],
+    parent_fitnesses: Sequence[float] | Tensor | None = None,
+    readout: Readout | None = None
+) -> Tensor:
+    val_a, val_b = vals
+    num_probes, device = val_a.shape[0], val_a.device
+    fits = torch.as_tensor(parent_fitnesses, device = device, dtype = torch.float32) if exists(parent_fitnesses) else None
+
+    if callable(filter_fn):
+        out = filter_fn(probes, dists, vals, fits)
+        if is_tensor(out) and out.shape == (2, num_probes):
+            return out.argmax(dim = 0).to(device)
+        return torch.as_tensor(out, device = device, dtype = torch.long).reshape(num_probes)
+
+    if filter_fn == 'critic':
+        return (val_b > val_a).long()
+
+    if filter_fn == 'entropy':
+        assert exists(readout), 'parent_filter="entropy" requires readout'
+        return (_probe_entropy(readout, dists[1]) < _probe_entropy(readout, dists[0])).long()
+
+    if filter_fn == 'fitness':
+        assert exists(fits), 'parent_filter="fitness" requires parent_fitnesses'
+        return torch.full((num_probes,), int(fits.argmax().item()), device = device, dtype = torch.long)
+
+    if filter_fn == 'random':
+        return torch.randint(0, 2, (num_probes,), device = device)
+
+    raise ValueError(f'unknown parent_filter {filter_fn!r} - choose from "critic", "entropy", "fitness", "random", or a callable')
+
+class SplitNorm(Module):
+    """
+    Normalizes the consolidated core `[0 : split_dim]` and fresh plastic reservoir
+    `[split_dim : dim]` independently while preserving identical parameter/buffer names
+    to `x_mlps_pytorch` and `torch.nn` LayerNorm / RMSNorm modules.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        split_dim: int | None = None,
+        *,
+        use_rms: bool = False,
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        use_gamma_offset: bool = True
+    ):
+        super().__init__()
+        self.dim = dim
+        self.split_dim = split_dim
+        self.use_rms = use_rms
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        self.use_gamma_offset = use_gamma_offset
+
+        if use_gamma_offset:
+            if elementwise_affine:
+                self.gamma = nn.Parameter(torch.zeros(dim))
+            else:
+                self.register_buffer('gamma', torch.ones(dim))
+            self.offset = float(elementwise_affine)
+        else:
+            if elementwise_affine:
+                self.weight = nn.Parameter(torch.ones(dim))
+                self.bias = None if use_rms else nn.Parameter(torch.zeros(dim))
+            else:
+                self.register_parameter('weight', None)
+                self.register_parameter('bias', None)
+
+    def _norm(self, x: Tensor, w: Tensor | None, b: Tensor | None) -> Tensor:
+        shape = x.shape[-1:]
+        if self.use_rms:
+            return F.rms_norm(x, shape, w, eps = self.eps)
+        return F.layer_norm(x, shape, w, b, eps = self.eps)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.use_gamma_offset:
+            w = self.gamma + self.offset
+            b = None
+        else:
+            w = self.weight
+            b = self.bias
+
+        s = self.split_dim
+        min_part = 1 if self.use_rms else 2
+
+        if not exists(s) or s < min_part or (self.dim - s) < min_part:
+            return self._norm(x, w, b)
+
+        w_l = w[:s] if exists(w) else None
+        w_r = w[s:] if exists(w) else None
+        b_l = b[:s] if exists(b) else None
+        b_r = b[s:] if exists(b) else None
+
+        return cat((
+            self._norm(x[..., :s], w_l, b_l),
+            self._norm(x[..., s:], w_r, b_r)
+        ), dim = -1)
+
+@torch.no_grad()
+def reborn_backbone_(
+    backbone: Module,
+    *,
+    dim_state: int,
+    old_dim: int,
+    new_dim: int,
+    keep_ratio: float = 0.5,
+    sparsity: float = 0.9,
+    core_sparsity: float = 0.9,
+    cross_scale: float = 0.05,
+    align_multiple: int = 2,
+    split_norms: bool = True
+):
+    """
+    Reinitializes a backbone as a distilled core `[0 : keep_dim]` plus a fresh sparse
+    plastic reservoir `[keep_dim : new_dim]`, resizing hidden widths when `new_dim != old_dim`.
+    Returns `(linear_records, norm_records)` used to share one gradient mask per tensor.
+    """
+    first_param = next(backbone.parameters(), None)
+    device = first_param.device if exists(first_param) else torch.device('cpu')
+    dtype = first_param.dtype if exists(first_param) else torch.float32
+
+    # find linears that directly consume the raw state (input linears)
+
+    input_linears = set()
+    mock_state = torch.zeros(dim_state, device = device, dtype = dtype)
+
+    def _track_input(mod, args):
+        if len(args) > 0 and is_tensor(args[0]) and args[0].data_ptr() == mock_state.data_ptr():
+            input_linears.add(mod)
+
+    hooks = [m.register_forward_pre_hook(_track_input) for m in backbone.modules() if isinstance(m, Linear)]
+
+    try:
+        backbone(mock_state)
+    finally:
+        for h in hooks:
+            h.remove()
+
+    # ResidualNormedMLP with Identity proj_in when growing width
+
+    if hasattr(backbone, 'proj_in') and isinstance(backbone.proj_in, nn.Identity) and new_dim != dim_state:
+        backbone.proj_in = Linear(dim_state, new_dim, device = device, dtype = dtype)
+        input_linears.add(backbone.proj_in)
+
+    def scale_dim(d):
+        if new_dim == old_dim:
+            return d
+        if d == old_dim:
+            return new_dim
+        return round_up_multiple(max(align_multiple, int(round(d * new_dim / old_dim))), align_multiple)
+
+    def keep_of(d):
+        if d <= 1:
+            return d
+        return max(1, min(d - 1, int(round(d * keep_ratio))))
+
+    linear_records = []
+    norm_records = []
+
+    def _process(parent):
+        for name, child in list(parent.named_children()):
+            if isinstance(child, Linear):
+                is_input = child in input_linears
+
+                in_f = child.in_features if is_input else scale_dim(child.in_features)
+                out_f = scale_dim(child.out_features)
+                has_bias = exists(child.bias)
+
+                if (in_f, out_f) != (child.in_features, child.out_features):
+                    child = Linear(in_f, out_f, bias = has_bias, device = device, dtype = dtype)
+                    setattr(parent, name, child)
+
+                in_keep = in_f if is_input else keep_of(in_f)
+                out_keep = keep_of(out_f)
+
+                # core | cross | right reservoir (or uniform full-width init when not split_norms)
+
+                if not split_norms:
+                    sparse_init_tensor_(child.weight, sparsity = sparsity)
+                elif is_input:
+                    sparse_init_tensor_(child.weight[:out_keep], sparsity = core_sparsity)
+                    if out_f > out_keep:
+                        sparse_init_tensor_(child.weight[out_keep:], sparsity = sparsity)
+                else:
+                    sparse_init_tensor_(child.weight[:out_keep, :in_keep], sparsity = core_sparsity)
+                    if in_f > in_keep:
+                        sparse_init_tensor_(child.weight[:out_keep, in_keep:], sparsity = sparsity, scale = cross_scale)
+                    if out_f > out_keep:
+                        sparse_init_tensor_(child.weight[out_keep:], sparsity = sparsity)
+
+                if has_bias:
+                    child.bias.zero_()
+
+                linear_records.append((child, is_input, in_keep, out_keep))
+
+            elif isinstance(child, (SplitNorm, XLayerNorm, XRMSNorm, nn.LayerNorm, nn.RMSNorm)):
+                if isinstance(child, SplitNorm):
+                    elem_affine = child.elementwise_affine
+                    cur_d = child.dim
+                    use_rms = child.use_rms
+                    use_gamma_offset = child.use_gamma_offset
+                    eps = child.eps
+                else:
+                    elem_affine = isinstance(getattr(child, 'gamma', None), nn.Parameter) or getattr(child, 'elementwise_affine', False)
+                    cur_d = child.gamma.shape[0] if hasattr(child, 'gamma') else child.normalized_shape[0]
+                    use_rms = isinstance(child, (XRMSNorm, nn.RMSNorm))
+                    use_gamma_offset = isinstance(child, (XLayerNorm, XRMSNorm))
+                    eps = child.eps
+
+                target_d = scale_dim(cur_d)
+                split_d = keep_of(target_d) if split_norms else None
+
+                child = SplitNorm(
+                    target_d,
+                    split_dim = split_d,
+                    use_rms = use_rms,
+                    eps = eps,
+                    elementwise_affine = elem_affine,
+                    use_gamma_offset = use_gamma_offset
+                ).to(device = device, dtype = dtype)
+
+                setattr(parent, name, child)
+
+                if elem_affine:
+                    p = child.gamma if use_gamma_offset else child.weight
+                    norm_records.append((p, keep_of(target_d)))
+                    if exists(getattr(child, 'bias', None)):
+                        norm_records.append((child.bias, keep_of(target_d)))
+            else:
+                _process(child)
+
+    _process(backbone)
+    return linear_records, norm_records
 
 # orthogonal projection for SPR in streaming setting
 # https://arxiv.org/abs/2602.09396
@@ -598,9 +888,38 @@ class StreamingACLambda(Module):
         hl_gauss_val_min = -3.,
         hl_gauss_val_max = 3.,
         hl_gauss_num_bins = 64,
-        use_chunked_td = False
+        use_chunked_td = False,
+        reborn_every = 0,
+        reborn_buffer_size = 2048,
+        reborn_keep_ratio = 0.5,
+        reborn_sparsity: float | None = None,
+        reborn_core_sparsity: float | None = None,
+        reborn_epochs = 16,
+        reborn_batch_size = 128,
+        reborn_lr = 3e-3,
+        reborn_cross_scale = 0.05,
+        reborn_grow = False,
+        reborn_grow_factor = 1.5,
+        reborn_max_dim: int | None = None,
+        reborn_scale_lr_with_grow = False,
+        reborn_retain = 1.0
     ):
         super().__init__()
+
+        self.dim_state = dim_state
+        self.dim_actor = dim_actor
+        self.dim_critic = dim_critic
+        self.num_discrete_actions = num_discrete_actions
+        self.num_continuous_actions = num_continuous_actions
+        self.actor_ema_beta = actor_ema_beta
+        self.critic_ema_beta = critic_ema_beta
+        self.spr_kwargs = spr_kwargs
+        self.lapo_kwargs = lapo_kwargs
+        self.hl_gauss_kwargs = dict(
+            min_value = hl_gauss_val_min,
+            max_value = hl_gauss_val_max,
+            num_bins = hl_gauss_num_bins,
+        )
 
         # minto (use online network if you can)
 
@@ -777,6 +1096,31 @@ class StreamingACLambda(Module):
                 'critic': BufferDict({name: param.detach().clone() for name, param in self.critic_full.named_parameters()})
             })
 
+        # continual reborn: half-distill + sparse reinit, optional width growth
+
+        assert 0. < reborn_keep_ratio < 1., 'reborn_keep_ratio must be in (0, 1)'
+        assert reborn_grow_factor >= 1., 'reborn_grow_factor must be >= 1.0'
+        assert 0. <= reborn_retain <= 1., 'reborn_retain must be in [0, 1]'
+
+        self.reborn_every = reborn_every
+        self.reborn_buffer_size = reborn_buffer_size
+        self.reborn_keep_ratio = reborn_keep_ratio
+        self.reborn_sparsity = default(reborn_sparsity, init_sparsity)
+        self.reborn_core_sparsity = reborn_core_sparsity
+        self.reborn_epochs = reborn_epochs
+        self.reborn_batch_size = reborn_batch_size
+        self.reborn_lr = reborn_lr
+        self.reborn_cross_scale = reborn_cross_scale
+        self.reborn_grow = reborn_grow
+        self.reborn_grow_factor = reborn_grow_factor
+        self.reborn_max_dim = reborn_max_dim
+        self.reborn_scale_lr_with_grow = reborn_scale_lr_with_grow
+        self.reborn_retain = reborn_retain
+
+        self.reborn_states = deque(maxlen = reborn_buffer_size) if reborn_buffer_size > 0 else None
+
+        self.register_buffer('update_step', tensor(0, dtype = torch.long), persistent = False)
+
 
     def save(self, path, overwrite = True):
         path = Path(path)
@@ -820,6 +1164,437 @@ class StreamingACLambda(Module):
             for m in self.critic_spr_aux_momentum.values():
                 m.zero_()
 
+    @torch.no_grad()
+    def _record_reborn_state_(self, normed_state: Tensor):
+        if not exists(self.reborn_states):
+            return
+
+        for row in normed_state.detach().reshape(-1, self.dim_state):
+            self.reborn_states.append(row.clone())
+
+    def _align_multiple(self) -> int:
+        mult = 2
+        if self.ssl_type == 'spr':
+            use_sem = self.spr_kwargs.get('use_sem', True)
+            if use_sem:
+                mult = math.lcm(mult, int(self.spr_kwargs.get('sem_dim_simplex', 8)))
+            num_sub = int(self.spr_kwargs.get('sigreg_num_subspaces', 1))
+            if num_sub > 1:
+                mult = math.lcm(mult, num_sub)
+        elif self.ssl_type == 'lapo':
+            mult = math.lcm(mult, int(self.lapo_kwargs.get('sem_dim_simplex', 4)))
+        return mult
+
+    def _compute_target_dim(
+        self,
+        cur_dim: int,
+        grow: bool,
+        grow_factor: float,
+        max_dim: int | None,
+        align_multiple: int
+    ) -> int:
+        if not grow or grow_factor <= 1.:
+            return cur_dim
+
+        target = round_up_multiple(max(cur_dim + align_multiple, int(round(cur_dim * grow_factor))), align_multiple)
+        if exists(max_dim):
+            target = min(target, (max_dim // align_multiple) * align_multiple)
+        return max(cur_dim, target)
+
+    def _reset_after_reborn_(self, device: torch.device):
+        ssl_action_kwargs = dict(
+            num_discrete_actions = self.num_discrete_actions,
+            num_continuous_actions = self.num_continuous_actions
+        )
+
+        if exists(self.ssl_type):
+            ssl_modules = dict(
+                spr = lambda dim: SelfPredictRepr(dim, **ssl_action_kwargs, **self.spr_kwargs),
+                lapo = lambda dim: LAPO(dim, dim_latent_action = dim, **ssl_action_kwargs, **self.lapo_kwargs)
+            )
+            self.actor_spr = ssl_modules[self.ssl_type](self.dim_actor).to(device)
+            self.critic_spr = ssl_modules[self.ssl_type](self.dim_critic).to(device)
+            self.actor_spr.apply(self.init_)
+            self.critic_spr.apply(self.init_)
+
+        actor_has_ema = self.actor_use_ema or (exists(self.actor_spr) and self.actor_spr.target_embed_from_ema)
+        self.actor_with_readout_ema = EMA(self.actor_with_readout, beta = self.actor_ema_beta).to(device) if actor_has_ema else None
+        self.actor_spr_ema = EMA(self.actor_spr.to_projection, beta = self.actor_ema_beta).to(device) if exists(self.actor_spr) and self.actor_spr.target_embed_from_ema else None
+
+        critic_has_ema = self.use_critic_ema or (exists(self.critic_spr) and self.critic_spr.target_embed_from_ema)
+        self.critic_ema = EMA(self.critic_full, beta = self.critic_ema_beta).to(device) if critic_has_ema else None
+        self.critic_spr_ema = EMA(self.critic_spr.to_projection, beta = self.critic_ema_beta).to(device) if exists(self.critic_spr) and self.critic_spr.target_embed_from_ema else None
+
+        self.actor_trace = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
+        self.critic_trace = BufferDict({name: torch.zeros_like(param) for name, param in self.critic_full.named_parameters()})
+
+        if self.adaptive:
+            self.step.zero_()
+            self.actor_v = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
+            self.critic_v = BufferDict({name: torch.zeros_like(param) for name, param in self.critic_full.named_parameters()})
+
+        if exists(self.ssl_type):
+            self.actor_spr_momentum = BufferDict({name: torch.zeros_like(param) for name, param in self.actor_with_readout.named_parameters()})
+            self.actor_spr_aux_momentum = BufferDict({str(i): torch.zeros_like(param) for i, param in enumerate(self.actor_spr.parameters())})
+            self.critic_spr_momentum = BufferDict({name: torch.zeros_like(param) for name, param in self.critic_full.named_parameters()})
+            self.critic_spr_aux_momentum = BufferDict({str(i): torch.zeros_like(param) for i, param in enumerate(self.critic_spr.parameters())})
+
+        if self.has_any_wd and self.wd_towards_init:
+            self.init_params = nn.ModuleDict({
+                'actor': BufferDict({name: param.detach().clone() for name, param in self.actor_with_readout.named_parameters()}),
+                'critic': BufferDict({name: param.detach().clone() for name, param in self.critic_full.named_parameters()})
+            })
+
+    @torch.no_grad()
+    def clone(
+        self,
+        reset_traces: bool = True,
+        device: torch.device | str | None = None
+    ) -> StreamingACLambda:
+        saved_states = self.reborn_states
+        self.reborn_states = None
+        try:
+            cloned = copy.deepcopy(self)
+        finally:
+            self.reborn_states = saved_states
+
+        if exists(device):
+            cloned = cloned.to(device)
+
+        target_device = next(cloned.actor_with_readout.parameters()).device
+        cloned.reborn_states = deque(maxlen = cloned.reborn_buffer_size) if cloned.reborn_buffer_size > 0 else None
+
+        if reset_traces:
+            cloned._reset_after_reborn_(target_device)
+
+        return cloned
+
+    @torch.no_grad()
+    def _teacher_targets(
+        self,
+        states: Tensor,
+        *,
+        raw_probes: Tensor | None,
+        other_states: Tensor | None,
+        parent_pair: tuple[StreamingACLambda, StreamingACLambda] | None,
+        parent_filter: str | Callable,
+        parent_fitnesses: Sequence[float] | Tensor | None,
+        retain: float
+    ) -> tuple[object, Tensor]:
+        if not exists(parent_pair):
+            teacher_actor = self.actor_with_readout_ema if self.actor_use_ema and exists(self.actor_with_readout_ema) else self.actor_with_readout
+            teacher_critic = self.critic_ema if self.use_critic_ema and exists(self.critic_ema) else self.critic_full
+            return (
+                tree_map_tensor(lambda t: t.detach().clone() * retain, teacher_actor(states)),
+                teacher_critic(states).detach().clone() * retain
+            )
+
+        pa, pb = parent_pair
+        states_a = pa.state_norm(raw_probes, update = False) if exists(raw_probes) else states
+        states_b = pb.state_norm(raw_probes, update = False) if exists(raw_probes) else (
+            other_states.detach().reshape(-1, self.dim_state).to(device = states.device, dtype = states.dtype) if exists(other_states) else states
+        )
+
+        actor_a = pa.actor_with_readout_ema if pa.actor_use_ema and exists(pa.actor_with_readout_ema) else pa.actor_with_readout
+        actor_b = pb.actor_with_readout_ema if pb.actor_use_ema and exists(pb.actor_with_readout_ema) else pb.actor_with_readout
+        critic_a = pa.critic_ema if pa.use_critic_ema and exists(pa.critic_ema) else pa.critic_full
+        critic_b = pb.critic_ema if pb.use_critic_ema and exists(pb.critic_ema) else pb.critic_full
+
+        dist_a = tree_map_tensor(lambda t: t.detach().clone(), actor_a(states_a))
+        dist_b = tree_map_tensor(lambda t: t.detach().clone(), actor_b(states_b))
+
+        self_std = self.reward_norm.variance.sqrt().clamp(min = 1e-5)
+        scale_a = float((pa.reward_norm.variance.sqrt() / self_std).item()) if pa.reward_norm is not self.reward_norm else 1.
+        scale_b = float((pb.reward_norm.variance.sqrt() / self_std).item()) if pb.reward_norm is not self.reward_norm else 1.
+
+        val_a = critic_a(states_a).detach().clone().reshape(-1) * scale_a
+        val_b = critic_b(states_b).detach().clone().reshape(-1) * scale_b
+
+        choice = _resolve_parent_choice(parent_filter, default(raw_probes, states), (dist_a, dist_b), (val_a, val_b), parent_fitnesses, readout = pa.readout)
+        mask_b = choice.bool()
+
+        chosen_dist = _tree_select_rows(dist_a, dist_b, mask_b)
+        return (
+            tree_map_tensor(lambda t: t * retain, chosen_dist),
+            torch.where(mask_b, val_b, val_a) * retain
+        )
+
+    def reborn_(
+        self,
+        states: Tensor | None = None,
+        *,
+        raw_states: Tensor | None = None,
+        other_parent: StreamingACLambda | None = None,
+        parents: tuple[StreamingACLambda, StreamingACLambda] | None = None,
+        other_states: Tensor | None = None,
+        parent_filter: str | Callable = 'critic',
+        parent_fitnesses: Sequence[float] | Tensor | None = None,
+        grow: bool | None = None,
+        grow_factor: float | None = None,
+        max_dim: int | None = None,
+        keep_ratio: float | None = None,
+        sparsity: float | None = None,
+        core_sparsity: float | None = None,
+        epochs: int | None = None,
+        batch_size: int | None = None,
+        lr: float | None = None,
+        cross_scale: float | None = None,
+        retain: float | None = None
+    ) -> RebornMetrics | None:
+        """
+        Consolidates policy/value into `[0 : keep_dim]` (`SplitNorm`) via distillation while
+        reinitializing `[keep_dim : new_dim]` as a fresh sparse plastic reservoir.
+        When `other_parent` or `parents` is given, performs two-parent phenotypic crossover,
+        selecting per probe state between the two parents via their value critics or `parent_filter`.
+        """
+        first_param = next(self.actor_with_readout.parameters())
+        device, dtype = first_param.device, first_param.dtype
+
+        if exists(parents):
+            assert len(parents) == 2, 'parents must be a pair of two StreamingACLambda individuals'
+            parent_pair = (parents[0], parents[1])
+        elif exists(other_parent):
+            parent_pair = (self, other_parent)
+        else:
+            parent_pair = None
+
+        grow = default(grow, self.reborn_grow)
+        grow_factor = default(grow_factor, self.reborn_grow_factor)
+        max_dim = default(max_dim, self.reborn_max_dim)
+        keep_ratio = default(keep_ratio, self.reborn_keep_ratio)
+        sparsity = default(sparsity, self.reborn_sparsity)
+        core_sparsity = default(core_sparsity, default(self.reborn_core_sparsity, sparsity))
+        epochs = default(epochs, self.reborn_epochs)
+        batch_size = default(batch_size, self.reborn_batch_size)
+        lr = default(lr, self.reborn_lr)
+        cross_scale = default(cross_scale, self.reborn_cross_scale)
+        retain = default(retain, self.reborn_retain)
+        do_distill = retain > 0.
+
+        raw_probes = None
+        teacher_dist, teacher_vals = None, None
+
+        if do_distill:
+            if exists(raw_states):
+                raw_probes = raw_states.detach().reshape(-1, self.dim_state).to(device = device, dtype = dtype)
+                if raw_probes.shape[0] == 0:
+                    return None
+                states = self.state_norm(raw_probes, update = False)
+            elif not exists(states):
+                if exists(parent_pair):
+                    pa, pb = parent_pair
+                    buf_a = list(pa.reborn_states) if exists(pa.reborn_states) else []
+                    buf_b = [] if (pa.reborn_states is pb.reborn_states or not exists(pb.reborn_states)) else list(pb.reborn_states)
+                    combined = buf_a + buf_b
+                    if len(combined) == 0:
+                        return None
+                    if self.reborn_buffer_size > 0 and len(combined) > self.reborn_buffer_size:
+                        step_idx = torch.linspace(0, len(combined) - 1, steps = self.reborn_buffer_size).round().long()
+                        combined = [combined[int(i)] for i in step_idx]
+                    states = torch.stack(combined)
+                else:
+                    if not exists(self.reborn_states) or len(self.reborn_states) == 0:
+                        return None
+                    states = torch.stack(list(self.reborn_states))
+
+            states = states.detach().reshape(-1, self.dim_state).to(device = device, dtype = dtype)
+            if states.shape[0] == 0:
+                return None
+
+            teacher_dist, teacher_vals = self._teacher_targets(
+                states,
+                raw_probes = raw_probes,
+                other_states = other_states,
+                parent_pair = parent_pair,
+                parent_filter = parent_filter,
+                parent_fitnesses = parent_fitnesses,
+                retain = retain
+            )
+
+        # resize and reinitialize backbones & readouts
+
+        align_mult = self._align_multiple()
+        old_dim_actor, old_dim_critic = self.dim_actor, self.dim_critic
+        base_dim_actor = max(old_dim_actor, *(p.dim_actor for p in parent_pair)) if exists(parent_pair) else old_dim_actor
+        base_dim_critic = max(old_dim_critic, *(p.dim_critic for p in parent_pair)) if exists(parent_pair) else old_dim_critic
+
+        new_dim_actor = self._compute_target_dim(base_dim_actor, grow, grow_factor, max_dim, align_mult)
+        new_dim_critic = self._compute_target_dim(base_dim_critic, grow, grow_factor, max_dim, align_mult)
+        keep_dim_actor = max(1, min(new_dim_actor - 1, int(round(new_dim_actor * keep_ratio)))) if new_dim_actor > 1 else 1
+        keep_dim_critic = max(1, min(new_dim_critic - 1, int(round(new_dim_critic * keep_ratio)))) if new_dim_critic > 1 else 1
+
+        actor_resized = new_dim_actor != old_dim_actor
+        critic_resized = new_dim_critic != old_dim_critic
+
+        actor_lins, actor_norms = reborn_backbone_(
+            self.actor,
+            dim_state = self.dim_state,
+            old_dim = old_dim_actor,
+            new_dim = new_dim_actor,
+            keep_ratio = keep_ratio,
+            sparsity = sparsity,
+            core_sparsity = core_sparsity,
+            cross_scale = cross_scale,
+            align_multiple = align_mult,
+            split_norms = do_distill
+        )
+        critic_lins, critic_norms = reborn_backbone_(
+            self.critic,
+            dim_state = self.dim_state,
+            old_dim = old_dim_critic,
+            new_dim = new_dim_critic,
+            keep_ratio = keep_ratio,
+            sparsity = sparsity,
+            core_sparsity = core_sparsity,
+            cross_scale = cross_scale,
+            align_multiple = align_mult,
+            split_norms = do_distill
+        )
+
+        if self.reborn_scale_lr_with_grow:
+            if actor_resized:
+                self.actor_lr = self.actor_lr * (new_dim_actor / old_dim_actor)
+            if critic_resized:
+                self.critic_lr = self.critic_lr * (new_dim_critic / old_dim_critic)
+
+        self.dim_actor = new_dim_actor
+        self.dim_critic = new_dim_critic
+
+        if actor_resized:
+            self.readout = Readout(
+                new_dim_actor,
+                num_discrete = self.num_discrete_actions,
+                num_continuous = self.num_continuous_actions
+            ).to(device = device, dtype = dtype)
+            self.actor_with_readout = Sequential(self.actor, self.readout)
+
+        if self.use_hl_gauss:
+            if critic_resized:
+                self.hl_gauss_layer = HLGaussLayer(dim = new_dim_critic, hl_gauss_loss = self.hl_gauss_kwargs).to(device = device, dtype = dtype)
+                self.critic_readout = self.hl_gauss_layer
+                self.critic_full = Sequential(self.critic, self.critic_readout)
+            critic_out_linear = self.hl_gauss_layer.to_pred
+        else:
+            if critic_resized:
+                self.critic_readout[0] = Linear(new_dim_critic, 1, device = device, dtype = dtype)
+                self.critic_full = Sequential(self.critic, self.critic_readout)
+            critic_out_linear = self.critic_readout[0]
+
+        with torch.no_grad():
+            if exists(self.readout.embeddings):
+                if do_distill:
+                    nn.init.normal_(self.readout.embeddings.weight[:, :keep_dim_actor], std = 1e-2)
+                    if new_dim_actor > keep_dim_actor:
+                        nn.init.normal_(self.readout.embeddings.weight[:, keep_dim_actor:], std = 1e-2 * cross_scale)
+                else:
+                    nn.init.normal_(self.readout.embeddings.weight, std = 1e-2)
+
+            if do_distill:
+                sparse_init_tensor_(critic_out_linear.weight[:, :keep_dim_critic], sparsity = core_sparsity)
+                if new_dim_critic > keep_dim_critic:
+                    sparse_init_tensor_(critic_out_linear.weight[:, keep_dim_critic:], sparsity = sparsity, scale = cross_scale)
+            else:
+                sparse_init_tensor_(critic_out_linear.weight, sparsity = sparsity)
+
+            if exists(critic_out_linear.bias):
+                critic_out_linear.bias.zero_()
+
+        # distill core while masking gradients on the fresh plastic half
+
+        if do_distill and epochs > 0:
+            weight_masks = []
+            with torch.no_grad():
+                for lin, is_input, in_keep, out_keep in actor_lins + critic_lins:
+                    mask = torch.zeros_like(lin.weight, dtype = torch.bool)
+                    if is_input:
+                        mask[:out_keep] = lin.weight[:out_keep] != 0
+                    else:
+                        mask[:out_keep, :in_keep] = lin.weight[:out_keep, :in_keep] != 0
+                    weight_masks.append((lin, mask))
+
+            with torch.enable_grad():
+                distill_params = list(self.actor_with_readout.parameters()) + list(self.critic_full.parameters())
+                optimizer = torch.optim.Adam(distill_params, lr = lr)
+
+                num_samples = states.shape[0]
+                eff_batch = min(batch_size, max(16, num_samples // 8)) if num_samples >= 32 else num_samples
+
+                for _ in range(epochs):
+                    perm = torch.randperm(num_samples, device = device)
+                    for start in range(0, num_samples, eff_batch):
+                        idx = perm[start:start + eff_batch]
+                        sb = states[idx]
+
+                        pred_dist = self.actor_with_readout(sb)
+                        teacher_batch_dist = tree_map_tensor(lambda t: t[idx], teacher_dist)
+                        loss_pi = _kl_mean(self.readout.kl_div(teacher_batch_dist, pred_dist))
+
+                        if self.use_hl_gauss:
+                            t_val = teacher_vals[idx].clamp(min = self.hl_gauss_kwargs['min_value'], max = self.hl_gauss_kwargs['max_value'])
+                            loss_v = self.hl_gauss_layer(self.critic(sb), t_val)
+                        else:
+                            loss_v = F.mse_loss(self.critic_full(sb), teacher_vals[idx])
+
+                        optimizer.zero_grad()
+                        (loss_pi + loss_v).backward()
+
+                        with torch.no_grad():
+                            for lin, mask in weight_masks:
+                                if exists(lin.weight.grad):
+                                    lin.weight.grad.mul_(mask)
+
+                            for lin, _, _, out_keep in actor_lins + critic_lins:
+                                if exists(lin.bias) and exists(lin.bias.grad):
+                                    lin.bias.grad[out_keep:].zero_()
+
+                            for norm_param, n_keep in actor_norms + critic_norms:
+                                if exists(norm_param.grad) and norm_param.shape[0] > n_keep:
+                                    norm_param.grad[n_keep:].zero_()
+
+                            if exists(self.readout.embeddings) and exists(self.readout.embeddings.weight.grad) and new_dim_actor > keep_dim_actor:
+                                self.readout.embeddings.weight.grad[:, keep_dim_actor:].zero_()
+
+                            if exists(critic_out_linear.weight.grad) and new_dim_critic > keep_dim_critic:
+                                critic_out_linear.weight.grad[:, keep_dim_critic:].zero_()
+
+                        optimizer.step()
+
+            with torch.no_grad():
+                if exists(self.readout.embeddings) and new_dim_actor > keep_dim_actor:
+                    core_std = self.readout.embeddings.weight[:, :keep_dim_actor].std().clamp(min = 1e-2).item()
+                    nn.init.normal_(self.readout.embeddings.weight[:, keep_dim_actor:], std = core_std * cross_scale)
+
+        self._reset_after_reborn_(device)
+
+        with torch.no_grad():
+            if do_distill:
+                post_dist = self.actor_with_readout(states)
+                actor_kl = float(_kl_mean(self.readout.kl_div(teacher_dist, post_dist)).item())
+                critic_loss = float(F.mse_loss(self.critic_full(states), teacher_vals).item())
+
+                core_zero_fracs, right_zero_fracs = [], []
+                for lin, is_input, in_keep, out_keep in actor_lins + critic_lins:
+                    w_core = lin.weight[:out_keep, :] if is_input else lin.weight[:out_keep, :in_keep]
+                    core_zero_fracs.append(float((w_core == 0).float().mean().item()))
+                    if lin.out_features > out_keep:
+                        right_zero_fracs.append(float((lin.weight[out_keep:] == 0).float().mean().item()))
+
+                core_sp = float(sum(core_zero_fracs) / len(core_zero_fracs)) if len(core_zero_fracs) > 0 else 0.
+                right_sp = float(sum(right_zero_fracs) / len(right_zero_fracs)) if len(right_zero_fracs) > 0 else 0.
+            else:
+                actor_kl, critic_loss = 0., 0.
+                zero_fracs = [float((lin.weight == 0).float().mean().item()) for lin, _, _, _ in actor_lins + critic_lins]
+                core_sp = right_sp = float(sum(zero_fracs) / len(zero_fracs)) if len(zero_fracs) > 0 else 0.
+
+        return RebornMetrics(
+            actor_kl = actor_kl,
+            critic_loss = critic_loss,
+            dim_actor = new_dim_actor,
+            dim_critic = new_dim_critic,
+            core_sparsity = core_sp,
+            right_sparsity = right_sp
+        )
+
     def update(
         self,
         state,
@@ -836,9 +1611,22 @@ class StreamingACLambda(Module):
         state = self.state_norm(state, update = True)
         next_state = self.state_norm(next_state, update = False)
 
+        if self.reborn_buffer_size > 0:
+            self._record_reborn_state_(state)
+
         normed_reward = self.reward_norm(reward, is_terminal = is_terminal, update = True)
 
         metrics = self._learn_step((state, action, normed_reward, next_state, is_terminal))
+
+        self.update_step.add_(1)
+
+        if (
+            self.reborn_every > 0 and
+            divisible_by(int(self.update_step.item()), self.reborn_every) and
+            exists(self.reborn_states) and
+            len(self.reborn_states) >= min(64, self.reborn_buffer_size)
+        ):
+            self.reborn_()
 
         return metrics
 
@@ -1222,3 +2010,17 @@ class StreamingACLambda(Module):
         sample = False
     ):
         return self.forward_action(state, sample = sample)
+
+def __getattr__(name: str):
+    if name in (
+        'AgentPool',
+        'ArchiveEntry',
+        'crossover_distill',
+        'reproduce_lerp',
+        'reproduce_shrink_perturb',
+        'policy_kl_distance',
+        'value_l1_distance'
+    ):
+        from streaming_deep_rl import agent_pool
+        return getattr(agent_pool, name)
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')

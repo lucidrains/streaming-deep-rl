@@ -6,6 +6,7 @@
 #   "gymnasium[box2d,other]",
 #   "fire",
 #   "tqdm",
+#   "torch-einops-utils>=0.2.4",
 #   "x-mlps-pytorch>=0.3.3",
 #   "einx",
 #   "rich",
@@ -46,7 +47,7 @@ from accelerate import Accelerator
 
 from torch_einops_utils import log_table
 
-from streaming_deep_rl.streaming_deep_rl import StreamingACLambda
+from streaming_deep_rl import StreamingACLambda, AgentPool
 from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
 
 # constants
@@ -151,7 +152,16 @@ def main(
     use_delightful_pg = False,
     delightful_eta = 1.0,
     depth = 3,
-    use_chunked_td = False
+    use_chunked_td = False,
+    reborn_every = 0,
+    reborn_grow = False,
+    reborn_grow_factor = 1.5,
+    reborn_max_dim: int | None = None,
+    reborn_sparsity: float | None = None,
+    pool_size: int = 1,
+    archive_size: int = 8,
+    evolve_every: int = 4000,
+    save_path: str | None = None
 ):
     if render:
         rmtree(VIDEO_FOLDER, ignore_errors = True)
@@ -268,8 +278,21 @@ def main(
         use_minto = use_minto,
         use_delightful_pg = use_delightful_pg,
         delightful_eta = delightful_eta,
-        use_chunked_td = use_chunked_td
+        use_chunked_td = use_chunked_td,
+        reborn_every = reborn_every,
+        reborn_grow = reborn_grow,
+        reborn_grow_factor = reborn_grow_factor,
+        reborn_max_dim = reborn_max_dim,
+        reborn_sparsity = reborn_sparsity
     )
+
+    if pool_size > 1:
+        agent = AgentPool(
+            agent,
+            pool_size = pool_size,
+            archive_size = archive_size,
+            evolve_every = evolve_every
+        )
 
     # metrics
 
@@ -294,7 +317,14 @@ def main(
         use_minto = use_minto,
         use_delightful_pg = use_delightful_pg,
         delightful_eta = delightful_eta,
-        use_chunked_td = use_chunked_td
+        use_chunked_td = use_chunked_td,
+        reborn_every = reborn_every,
+        reborn_grow = reborn_grow,
+        reborn_grow_factor = reborn_grow_factor,
+        reborn_max_dim = reborn_max_dim,
+        reborn_sparsity = reborn_sparsity,
+        pool_size = pool_size,
+        archive_size = archive_size
     ))
 
     # training loop
@@ -369,26 +399,42 @@ def main(
 
             avg_reward = np.mean(rolling_reward)
             avg_steps = np.mean(rolling_steps)
+            best_pool_reward = agent.best_rolling_reward(min_episodes = 20) if pool_size > 1 else None
+            best_pool_100 = agent.best_rolling_reward(min_episodes = 100) if pool_size > 1 else None
 
-            dashboard.update_episode_info(
+            ep_info = dict(
                 avg_cum_reward_100 = f"{avg_reward:.2f}",
                 avg_steps_100 = f"{avg_steps:.1f}"
             )
+            if best_pool_reward is not None:
+                ep_info['best_individual_avg'] = f"{best_pool_reward:.2f}"
+
+            dashboard.update_episode_info(**ep_info)
 
             if use_live:
                 live.update(dashboard.create_renderable())
 
             if log_every > 0 and divisible_by(episode + 1, log_every):
-                log_table(
+                log_kwargs = dict(
                     ep = episode + 1,
                     reward = eps_reward,
                     steps = eps_steps,
                     avg100 = avg_reward,
                     formatters = dict(reward = '.2f', avg100 = '.2f')
                 )
+                if best_pool_reward is not None:
+                    log_kwargs['best_ind'] = best_pool_reward
+                    log_kwargs['formatters']['best_ind'] = '.2f'
+                log_table(**log_kwargs)
 
-            if stop_when_solved and len(rolling_reward) == rolling_reward.maxlen and avg_reward >= 200.:
-                print(f'SOLVED at episode {episode + 1} with avg100 {avg_reward:.2f}', flush = True)
+            stream_solved = len(rolling_reward) == rolling_reward.maxlen and avg_reward >= 200.
+            pool_solved = best_pool_100 is not None and best_pool_100 >= 200.
+
+            if stop_when_solved and (stream_solved or pool_solved):
+                if pool_solved and not stream_solved:
+                    print(f'SOLVED at episode {episode + 1} by pool individual {agent.best_index} with best100 {best_pool_100:.2f} (stream avg100 {avg_reward:.2f})', flush = True)
+                else:
+                    print(f'SOLVED at episode {episode + 1} with avg100 {avg_reward:.2f}', flush = True)
                 break
 
             # wandb logging
@@ -403,6 +449,9 @@ def main(
                     value_pred = metrics.value_pred,
                     chunked_td_lambda = metrics.chunked_td_lambda,
                 ), step = episode)
+
+    if save_path is not None:
+        agent.save(save_path, overwrite = True)
 
     if use_wandb:
         accelerator.end_training()
